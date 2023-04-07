@@ -13,7 +13,6 @@ const client = new Client({
   ]
 });
 
-//const { prefix, token } = require('./.env.config');
 const prefix = process.env.PREFIX;
 const token = process.env.TOKEN;
 
@@ -40,7 +39,7 @@ client.on('messageCreate', async (message) => {
   }
   
 
-  if (command === 'raadio') {
+  if (command === 'radio') {
     
     const channelNames = Object.keys(radioChannels)
     const randomChannelName = channelNames[Math.floor(Math.random() * channelNames.length)];
@@ -48,15 +47,15 @@ client.on('messageCreate', async (message) => {
 
     if(args[0] in radioChannels){
       playedChannel = radioChannels[args[0]];
-      message.reply('Mängib: '+ args[0]);
+      message.reply('Currently playing: '+ args[0]);
     }else{
       playedChannel = radioChannels[randomChannelName]
-      message.reply('Mängib: '+ randomChannelName);
+      message.reply('Currently playing: '+ randomChannelName);
     }
 
     const voiceChannel = message.member.voice.channel;
     if (!voiceChannel) {
-      return message.reply('Mine häälekanalisse.');
+      return message.reply('You must be in a voice channel!');
     }
     try {
       const connection = await joinVoiceChannel({
@@ -101,7 +100,7 @@ client.on('messageCreate', async (message) => {
       });
     } catch (err) {
       console.error(err);
-      message.reply('Midägi on katki :(');
+      message.reply('Error on joing channel');
     }
   }
 });
