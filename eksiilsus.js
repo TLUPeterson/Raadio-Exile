@@ -1,10 +1,9 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const { AudioPlayerStatus, createAudioPlayer, joinVoiceChannel, createAudioResource } = require('@discordjs/voice');
-const ytdl = require('ytdl-core');
-const search = require('youtube-search');
+const play = require('play-dl');
 const https = require('https');
 require('dotenv').config();
-const libsodium = require('libsodium-wrappers');
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -42,15 +41,9 @@ client.on('messageCreate', async (message) => {
   if (command === 'raadio') {
     const channelNames = Object.keys(radioChannels);
     const randomChannelName = channelNames[Math.floor(Math.random() * channelNames.length)];
-    let playedChannel = '';
 
-    if (args[0] in radioChannels) {
-      playedChannel = radioChannels[args[0]];
-      message.reply('Mängib: ' + args[0]);
-    } else {
-      playedChannel = radioChannels[randomChannelName];
-      message.reply('Mängib: ' + randomChannelName);
-    }
+    let playedChannel = args[0] in radioChannels ? radioChannels[args[0]] : radioChannels[randomChannelName];
+    message.reply('Mängib: ' + (args[0] || randomChannelName));
 
     const voiceChannel = message.member.voice.channel;
     if (!voiceChannel) {
@@ -64,32 +57,9 @@ client.on('messageCreate', async (message) => {
         adapterCreator: message.guild.voiceAdapterCreator,
       });
 
-      const player = createAudioPlayer({
-        debug: true,
-        encodingEngine: {
-          voiceDataTimeout: 2000,
-          voiceDataBufferSize: 8192,
-          secretKey: libsodium.crypto_secretbox_KEYBYTES,
-          getEncryptionMode: () => 'xsalsa20_poly1305',
-          getEncryptionNonce: () => libsodium.randombytes_buf(libsodium.crypto_secretbox_NONCEBYTES),
-          getEncryptionKey: (secretKey, nonce) => libsodium.crypto_secretbox_keygen(),
-          getEncryptionPacket: (data, secretKey, nonce, key) => {
-            const encrypted = libsodium.crypto_secretbox_easy(data, nonce, key);
-            return {
-              packet: encrypted,
-              packetNonce: nonce,
-            };
-          },
-          getDecryptionPacket: (packet, secretKey, packetNonce) => {
-            const decrypted = libsodium.crypto_secretbox_open_easy(packet, packetNonce, secretKey);
-            return decrypted;
-          },
-        },
-      });
+      const player = createAudioPlayer();
       connection.subscribe(player);
 
-      if (playedChannel.startsWith('https://')) {
-        // Radio channel
         https.get(playedChannel, (res) => {
           const resource = createAudioResource(res);
           player.play(resource);
@@ -100,20 +70,9 @@ client.on('messageCreate', async (message) => {
           console.error(err);
           connection.destroy();
         });
-      } else {
-        // YouTube channel
-        const videoID = getVideoID(playedChannel);
-        const info = await getInfo(videoID);
-
-        const resource = createAudioResource(ytdl(playedChannel, { filter: 'audioonly' }), { inlineVolume: true });
-        player.play(resource);
-        player.on(AudioPlayerStatus.Idle, () => {
-          connection.destroy();
-        });
-      }
     } catch (err) {
       console.error(err);
-      message.reply('Midägi on katki :(');
+      message.reply('Player error');
     }
   } else if (command === 'youtube') {
     const voiceChannel = message.member.voice.channel;
@@ -121,49 +80,39 @@ client.on('messageCreate', async (message) => {
       return message.reply('Mine häälekanalisse.');
     }
 
-    const searchQuery = args.join(' ');
-    const options = {
-      maxResults: 1,
-      key: process.env.YOUTUBE_API_KEY,
-    };
-
-    search(searchQuery, options, async (err, results) => {
-      if (err) {
-        console.error(err);
-        return message.reply('Midägi on katki :(');
-      }
-
-      const video = results[0];
-      if (!video) {
-        return message.reply('Videot ei leitud.');
-      }
-
-      const videoID = video.id;
-      const videoTitle = video.title;
-
-      try {
-        const connection = await joinVoiceChannel({
-          channelId: voiceChannel.id,
-          guildId: message.guild.id,
-          adapterCreator: message.guild.voiceAdapterCreator,
-        });
-
-        const player = createAudioPlayer();
-        connection.subscribe(player);
-
-        const resource = createAudioResource(ytdl(videoID, { filter: 'audioonly' }), { inlineVolume: true });
-        player.play(resource);
-        player.on(AudioPlayerStatus.Idle, () => {
-          connection.destroy();
-        });
-
-        message.reply(`Mängib YouTube'i videot: ${videoTitle}`);
-      } catch (err) {
-        console.error(err);
-        message.reply('Midägi on katki :(');
-      }
+    const connection = await joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
     });
+
+    const query = args.join(' ');
+    await playYouTubeVideo(query, connection, message);
   }
 });
+
+async function playYouTubeVideo(query, connection, message) {
+  try {
+    const videos = await play.search(query, { limit: 1 });
+
+    if (!videos || videos.length === 0) {
+      return message.reply('Videot ei leitud.');
+    }
+
+    const video = videos[0];
+    const stream = await play.stream(video.url);
+    const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    const player = createAudioPlayer();
+    player.play(resource);
+    player.on(AudioPlayerStatus.Idle, () => {
+      connection.destroy();
+    });
+
+    connection.subscribe(player);
+  } catch (err) {
+    console.error(err);
+    message.reply('Midägi on katki :(');
+  }
+}
 
 client.login(token);
