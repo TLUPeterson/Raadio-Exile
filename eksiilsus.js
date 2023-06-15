@@ -1,24 +1,24 @@
 const { Client, GatewayIntentBits } = require('discord.js');
-const { AudioPlayerStatus, createAudioPlayer , joinVoiceChannel, createAudioResource } = require('@discordjs/voice');
+const { AudioPlayerStatus, createAudioPlayer, joinVoiceChannel, createAudioResource } = require('@discordjs/voice');
+const ytdl = require('ytdl-core');
+const search = require('youtube-search');
 const https = require('https');
 require('dotenv').config();
 const libsodium = require('libsodium-wrappers');
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildVoiceStates,
     GatewayIntentBits.MessageContent,
-  ]
+  ],
 });
 
-//const { prefix, token } = require('./.env.config');
 const prefix = process.env.PREFIX;
 const token = process.env.TOKEN;
 
-client.on('ready', client => {
-	console.log(`Logged in as ${client.user.tag}!`);
+client.on('ready', () => {
+  console.log(`Logged in as ${client.user.tag}!`);
 });
 
 client.on('messageCreate', async (message) => {
@@ -27,7 +27,7 @@ client.on('messageCreate', async (message) => {
 
   const args = message.content.toLowerCase().slice(prefix.length).trim().split(/ +/g);
   const command = args.shift().toLowerCase();
-//http://fmstream.org/index.php?c=EST
+
   const radioChannels = {
     'raadio2': 'https://icecast.err.ee/raadio2madal.mp3',
     'viker': 'https://icecast.err.ee/vikerraadiomadal.mp3',
@@ -37,27 +37,26 @@ client.on('messageCreate', async (message) => {
     'retro': 'https://edge02.cdn.bitflip.ee:8888/RETRO',
     'power': 'https://ice.leviracloud.eu/phr96-aac',
     'rock': 'https://edge03.cdn.bitflip.ee:8888/rck?_i=c1283824',
-  }
-  
+  };
 
   if (command === 'raadio') {
-    
-    const channelNames = Object.keys(radioChannels)
+    const channelNames = Object.keys(radioChannels);
     const randomChannelName = channelNames[Math.floor(Math.random() * channelNames.length)];
     let playedChannel = '';
 
-    if(args[0] in radioChannels){
+    if (args[0] in radioChannels) {
       playedChannel = radioChannels[args[0]];
-      message.reply('Mängib: '+ args[0]);
-    }else{
-      playedChannel = radioChannels[randomChannelName]
-      message.reply('Mängib: '+ randomChannelName);
+      message.reply('Mängib: ' + args[0]);
+    } else {
+      playedChannel = radioChannels[randomChannelName];
+      message.reply('Mängib: ' + randomChannelName);
     }
 
     const voiceChannel = message.member.voice.channel;
     if (!voiceChannel) {
       return message.reply('Mine häälekanalisse.');
     }
+
     try {
       const connection = await joinVoiceChannel({
         channelId: voiceChannel.id,
@@ -89,20 +88,82 @@ client.on('messageCreate', async (message) => {
       });
       connection.subscribe(player);
 
-      https.get(playedChannel, (res) => {
-        const resource = createAudioResource(res);
+      if (playedChannel.startsWith('https://')) {
+        // Radio channel
+        https.get(playedChannel, (res) => {
+          const resource = createAudioResource(res);
+          player.play(resource);
+          player.on(AudioPlayerStatus.Idle, () => {
+            connection.destroy();
+          });
+        }).on('error', (err) => {
+          console.error(err);
+          connection.destroy();
+        });
+      } else {
+        // YouTube channel
+        const videoID = getVideoID(playedChannel);
+        const info = await getInfo(videoID);
+
+        const resource = createAudioResource(ytdl(playedChannel, { filter: 'audioonly' }), { inlineVolume: true });
         player.play(resource);
         player.on(AudioPlayerStatus.Idle, () => {
           connection.destroy();
         });
-      }).on('error', (err) => {
-        console.error(err);
-        connection.destroy();
-      });
+      }
     } catch (err) {
       console.error(err);
       message.reply('Midägi on katki :(');
     }
+  } else if (command === 'youtube') {
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) {
+      return message.reply('Mine häälekanalisse.');
+    }
+
+    const searchQuery = args.join(' ');
+    const options = {
+      maxResults: 1,
+      key: process.env.YOUTUBE_API_KEY,
+    };
+
+    search(searchQuery, options, async (err, results) => {
+      if (err) {
+        console.error(err);
+        return message.reply('Midägi on katki :(');
+      }
+
+      const video = results[0];
+      if (!video) {
+        return message.reply('Videot ei leitud.');
+      }
+
+      const videoID = video.id;
+      const videoTitle = video.title;
+
+      try {
+        const connection = await joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: message.guild.id,
+          adapterCreator: message.guild.voiceAdapterCreator,
+        });
+
+        const player = createAudioPlayer();
+        connection.subscribe(player);
+
+        const resource = createAudioResource(ytdl(videoID, { filter: 'audioonly' }), { inlineVolume: true });
+        player.play(resource);
+        player.on(AudioPlayerStatus.Idle, () => {
+          connection.destroy();
+        });
+
+        message.reply(`Mängib YouTube'i videot: ${videoTitle}`);
+      } catch (err) {
+        console.error(err);
+        message.reply('Midägi on katki :(');
+      }
+    });
   }
 });
+
 client.login(token);
