@@ -10,6 +10,8 @@ token= ""
 
 run "npm install" in terminal
 
-and run bot with "node radiobot.js"
+and run bot with "node eksiilsus.js"
 
-"!radio" plays random song from the list determined in the radiobot.js file.
+"!raadio" plays random song from the list determined in the eksiilsus.js file. Command has to be followed by radio name ie. "!raadio elmar"
+ 
+ "!youtube" allows youtube search functionality
