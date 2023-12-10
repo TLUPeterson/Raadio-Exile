@@ -9,6 +9,7 @@ token= ""
 ```
 
 run "npm install" in terminal
+might nede to run "npm i libsodium-wrappers"
 
 and run bot with "node eksiilsus.js"
 
