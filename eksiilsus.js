@@ -36,6 +36,7 @@ client.on('messageCreate', async (message) => {
     'retro': 'https://edge02.cdn.bitflip.ee:8888/RETRO',
     'power': 'https://ice.leviracloud.eu/phr96-aac',
     'rock': 'https://edge03.cdn.bitflip.ee:8888/rck?_i=c1283824',
+    'starfm': 'https://ice.leviracloud.eu/star320-mp3',
   };
 
   if (command === 'raadio') {
