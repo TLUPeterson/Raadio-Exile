@@ -16,7 +16,14 @@ const playRadio = async (message, args) => {
 
   const channelNames = Object.keys(radioChannels);
   const randomChannelName = channelNames[Math.floor(Math.random() * channelNames.length)];
-
+  let channelName = "";
+  
+  if (args[0] in radioChannels){
+    console.log('Yes yes yes')
+    channelName = args[0]
+  }else{
+    channelName = randomChannelName;
+  }
   let playedChannel = args[0] in radioChannels ? radioChannels[args[0]] : radioChannels[randomChannelName];
 
   const voiceChannel = message.member.voice.channel;
@@ -34,7 +41,7 @@ const playRadio = async (message, args) => {
 
     const player = createAudioPlayer();
     connection.subscribe(player);
-    message.reply(`Naudi: ${randomChannelName}`);
+    message.reply(`Naudi: ${channelName}`);
 
     https.get(playedChannel, (res) => {
       const resource = createAudioResource(res);
