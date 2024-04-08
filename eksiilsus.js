@@ -1,6 +1,6 @@
 const { Client, GatewayIntentBits } = require('discord.js');
 const { playRadio } = require('./radio');
-const { playYouTube } = require('./yt');
+const { playYouTube, skipSong } = require('./yt');
 const { playSpotify } = require('./spotify');
 require('dotenv').config();
 
@@ -33,6 +33,8 @@ client.on('messageCreate', async (message) => {
     playYouTube(message, args);
   } else if (command === 'spotify') {
     playSpotify(message, args);
+  } else if (command === 'skip'){
+    skipSong();
   }
 });
 
