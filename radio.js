@@ -17,6 +17,7 @@ const radioChannels = {
   'power': { name: 'Power Hit Radio', url: 'https://ice.leviracloud.eu/phr96-aac' },
   'rock': { name: 'Rock FM', url: 'https://edge03.cdn.bitflip.ee:8888/rck?_i=c1283824' },
   'starfm': { name: 'Star FM', url: 'https://ice.leviracloud.eu/star320-mp3' },
+  'vomba': { name: 'Võmba FM', url: 'https://c4.radioboss.fm:18123/stream' },
 };
 
 
