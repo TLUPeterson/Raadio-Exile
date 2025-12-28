@@ -18,8 +18,9 @@ function fmstreamFetch(url) {
 }
 
 async function fmstream(params = {}) {
-  const keya = 0xad4a;
-  const keyb = 0x619a;
+  
+  const keya = process.env.keya;
+  const keyb = process.env.keyb;
 
   const unix = Math.floor(Date.now() / 1000);
   const key = Math.round(keya * unix + keyb).toString(16);
