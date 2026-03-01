@@ -9,6 +9,9 @@ const {
 } = require('@discordjs/voice');
 const { EmbedBuilder } = require('discord.js');
 const { execFile } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { promisify } = require('util');
 const prism = require('prism-media');
 const { Innertube, Platform, UniversalCache } = require('youtubei.js');
@@ -16,6 +19,35 @@ const { Innertube, Platform, UniversalCache } = require('youtubei.js');
 const execFileAsync = promisify(execFile);
 let innertubePromise = null;
 const pythonCommand = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3');
+
+function buildYtDlpCookieFile() {
+  const cookieString = process.env.YOUTUBE_COOKIE?.trim();
+  if (!cookieString) return null;
+
+  const lines = [
+    '# Netscape HTTP Cookie File',
+  ];
+
+  for (const part of cookieString.split(';')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex === -1) continue;
+
+    const name = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim();
+    if (!name) continue;
+
+    lines.push(`.youtube.com\tTRUE\t/\tTRUE\t2147483647\t${name}\t${value}`);
+  }
+
+  if (lines.length === 1) return null;
+
+  const filePath = path.join(os.tmpdir(), `raadio-exile-ytdlp-cookies-${process.pid}.txt`);
+  fs.writeFileSync(filePath, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  return filePath;
+}
 
 if (typeof Platform?.shim?.eval !== 'function' || String(Platform.shim.eval).includes('throw')) {
   Platform.shim.eval = (code, env = {}) => {
@@ -234,7 +266,7 @@ async function searchFirstVideo(query) {
 }
 
 async function resolveYtDlpStreamUrl(videoUrl) {
-  const { stdout } = await execFileAsync(pythonCommand, [
+  const args = [
     '-m',
     'yt_dlp',
     '--js-runtimes',
@@ -244,17 +276,30 @@ async function resolveYtDlpStreamUrl(videoUrl) {
     '-g',
     '--no-playlist',
     videoUrl,
-  ], {
-    windowsHide: true,
-    maxBuffer: 1024 * 1024,
-  });
+  ];
 
-  const directUrl = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-  if (!directUrl) {
-    throw new Error('yt-dlp did not return a stream URL');
+  const cookieFile = buildYtDlpCookieFile();
+  if (cookieFile) {
+    args.splice(4, 0, '--cookies', cookieFile);
   }
 
-  return directUrl;
+  try {
+    const { stdout } = await execFileAsync(pythonCommand, args, {
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+
+    const directUrl = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (!directUrl) {
+      throw new Error('yt-dlp did not return a stream URL');
+    }
+
+    return directUrl;
+  } finally {
+    if (cookieFile) {
+      fs.rmSync(cookieFile, { force: true });
+    }
+  }
 }
 
 function addToQueue(message, video, guildId, guildStates, options = {}) {
