@@ -15,6 +15,7 @@ const { Innertube, Platform, UniversalCache } = require('youtubei.js');
 
 const execFileAsync = promisify(execFile);
 let innertubePromise = null;
+const pythonCommand = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3');
 
 if (typeof Platform?.shim?.eval !== 'function' || String(Platform.shim.eval).includes('throw')) {
   Platform.shim.eval = (code, env = {}) => {
@@ -233,7 +234,7 @@ async function searchFirstVideo(query) {
 }
 
 async function resolveYtDlpStreamUrl(videoUrl) {
-  const { stdout } = await execFileAsync('py', [
+  const { stdout } = await execFileAsync(pythonCommand, [
     '-m',
     'yt_dlp',
     '--js-runtimes',
