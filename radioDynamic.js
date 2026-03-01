@@ -1,70 +1,11 @@
-// radioDynamic.js
 const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { fmstream } = require('./fmstream');
 const countries = require('./data/countries');
 const styles = require('./data/styles');
 const radio = require('./radio');
 
-// STEP 2: show country menu
-async function showCountryMenu(interaction) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId('radio_country')
-    .setPlaceholder('Vali riik')
-    .addOptions(
-      countries.map(c => ({
-        label: c.name,
-        value: c.code,
-      }))
-    );
-
-  await interaction.update({
-    content: 'Vali riik:',
-    components: [new ActionRowBuilder().addComponents(menu)],
-  });
-}
-
-// STEP 3: show style menu
-async function showStyleMenu(interaction, countryCode) {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId(`radio_style:${countryCode}`)
-    .setPlaceholder('Vali stiil/žanr')
-    .addOptions(styles);
-
-  await interaction.update({
-    content: `Valitud riik: **${countryCode}**\nVali nüüd stiil/žanr:`,
-    components: [new ActionRowBuilder().addComponents(menu)],
-  });
-}
-
-// STEP 4: show station list for country + style
-// NOTE: now takes guildStates param so we can store station list
-async function showStationMenu(interaction, countryCode, style, guildStates) {
-  let api;
-  try {
-    api = await fmstream({ c: countryCode, style, hq: 1 });
-  } catch (e) {
-    console.error('[FMStream] Error fetching stations:', e);
-    return interaction.update({
-      content: 'Tekkis viga jaamade pärimisel. Proovi uuesti.',
-      components: [],
-    });
-  }
-
-  if (!api.data || api.data.length === 0) {
-    // REFRESH STYLE MENU IF EMPTY
-    const styleMenu = new StringSelectMenuBuilder()
-      .setCustomId(`radio_style:${countryCode}`)
-      .setPlaceholder('Vali muu stiil/žanr')
-      .addOptions(styles);
-
-    return interaction.update({
-      content: `❌ Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${style}**.\nVali mõni muu stiil:`,
-      components: [new ActionRowBuilder().addComponents(styleMenu)],
-    });
-  }
-
-  const guildId = interaction.guildId;
-  let state = guildStates.get(guildId);
+function getOrCreateState(interaction, guildStates) {
+  let state = guildStates.get(interaction.guildId);
   if (!state) {
     state = {
       connection: null,
@@ -77,21 +18,82 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
       playerListenersAttached: false,
       nowPlayingRadioMsgId: null,
       lastPlayedRadioKey: null,
+      lastPlayedRadioInfo: null,
+      announcementIntervalId: null,
+      isAnnouncementPlaying: false,
+      resumeRadioAfterAnnouncement: false,
     };
-    guildStates.set(guildId, state);
+    guildStates.set(interaction.guildId, state);
   }
 
-  // Store station search in guild state so pickStation can use it
+  state.textChannel = interaction.channel;
+  return state;
+}
+
+async function showCountryMenu(interaction) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('radio_country')
+    .setPlaceholder('Vali riik')
+    .addOptions(
+      countries.map((country) => ({
+        label: country.name,
+        value: country.code,
+      }))
+    );
+
+  await interaction.update({
+    content: 'Vali riik:',
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function showStyleMenu(interaction, countryCode) {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`radio_style:${countryCode}`)
+    .setPlaceholder('Vali stiil/zhanr')
+    .addOptions(styles);
+
+  await interaction.update({
+    content: `Valitud riik: **${countryCode}**\nVali nuud stiil/zhanr:`,
+    components: [new ActionRowBuilder().addComponents(menu)],
+  });
+}
+
+async function showStationMenu(interaction, countryCode, style, guildStates) {
+  let api;
+  try {
+    api = await fmstream({ c: countryCode, style, hq: 1 });
+  } catch (error) {
+    console.error('[FMStream] Error fetching stations:', error);
+    return interaction.update({
+      content: 'Tekkis viga jaamade parimisel. Proovi uuesti.',
+      components: [],
+    });
+  }
+
+  if (!api.data || api.data.length === 0) {
+    const styleMenu = new StringSelectMenuBuilder()
+      .setCustomId(`radio_style:${countryCode}`)
+      .setPlaceholder('Vali muu stiil/zhanr')
+      .addOptions(styles);
+
+    return interaction.update({
+      content: `Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${style}**.\nVali moni muu stiil:`,
+      components: [new ActionRowBuilder().addComponents(styleMenu)],
+    });
+  }
+
+  const state = getOrCreateState(interaction, guildStates);
   state.stationSearch = {
     country: countryCode,
     style,
     stations: api.data,
   };
 
-  const stations = api.data.slice(0, 25).map(st => ({
-    label: st.program.slice(0, 80),
-    description: (st.description || 'Kirjeldus puudub').slice(0, 90),
-    value: st.id.toString(), // just the ID, simpler
+  const stations = api.data.slice(0, 25).map((station) => ({
+    label: station.program.slice(0, 80),
+    description: (station.description || 'Kirjeldus puudub').slice(0, 90),
+    value: String(station.id),
   }));
 
   const menu = new StringSelectMenuBuilder()
@@ -105,84 +107,79 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
   });
 }
 
-// STEP 5: user picks a specific station
 async function pickStation(interaction, guildStates) {
-  // Immediate defer to prevent "Interaction failed"
   await interaction.deferUpdate();
 
+  const state = guildStates.get(interaction.guildId);
   const stationId = interaction.values[0];
-
-  // cached by showStationMenu()
-  const cache = interaction.client.stationCache?.[interaction.guildId];
+  const cache = state?.stationSearch?.stations;
 
   if (!cache) {
-    return interaction.update({
-      content: "❌ Jaamade nimekiri ei ole saadaval. Alusta uuesti (vali riik + stiil).",
-      components: []
+    return interaction.followUp({
+      content: 'Jaamade nimekiri ei ole saadaval. Alusta uuesti riigi ja stiili valikust.',
+      ephemeral: true,
     });
   }
 
-  const station = cache.find(s => String(s.id) === stationId);
-
+  const station = cache.find((item) => String(item.id) === stationId);
   if (!station) {
-    return interaction.update({
-      content: "❌ Jaama ei leitud. Proovi uuesti.",
-      components: []
+    return interaction.followUp({
+      content: 'Jaama ei leitud. Proovi uuesti.',
+      ephemeral: true,
     });
   }
 
-  // Pick FIRST working stream
   const stream = station.urls?.[0]?.url || station.urls?.[0] || null;
-
   if (!stream) {
-    return interaction.update({
-      content: `❌ Jaamal **${station.program}** puudub toimiv URL.`,
-      components: []
+    return interaction.followUp({
+      content: `Jaamal **${station.program}** puudub toimiv URL.`,
+      ephemeral: true,
     });
   }
 
-  // PLAY using your existing radio.js logic
   await radio.playRadioStream(
     interaction,
     { name: station.program, url: stream },
     guildStates
   );
-  // Defer is already done at start
 }
 
-// Random worldwide station (c=RD)
 async function playRandomWorld(interaction, guildStates) {
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.deferUpdate();
+  }
+
   let api;
   try {
     api = await fmstream({ c: 'RD' });
-  } catch (e) {
-    console.error('[FMStream] Error fetching random station:', e);
-    return interaction.update({
+  } catch (error) {
+    console.error('[FMStream] Error fetching random station:', error);
+    return interaction.followUp({
       content: 'Tekkis viga juhusliku jaama toomisel.',
-      components: [],
+      ephemeral: true,
     });
   }
 
   if (!api.data || api.data.length === 0) {
-    return interaction.update({
+    return interaction.followUp({
       content: 'Juhuslikke jaamu ei leitud. Proovi uuesti.',
-      components: [],
+      ephemeral: true,
     });
   }
 
   const station = api.data[0];
   const stream = station.urls?.[0]?.url;
   if (!stream) {
-    return interaction.update({
+    return interaction.followUp({
       content: 'Juhuslikul jaamal puudub striim.',
-      components: [],
+      ephemeral: true,
     });
   }
 
-  await interaction.update({
-    content: `🎲 Juhuslik jaam:\n🎧 **${station.program}**\n🌍 ${station.country}\n\nMängin nüüd...`,
-    components: [],
-  });
+  await interaction.followUp({
+    content: `Juhuslik jaam: **${station.program}** (${station.country})`,
+    ephemeral: true,
+  }).catch(() => {});
 
   await radio.playRadioStream(
     interaction,

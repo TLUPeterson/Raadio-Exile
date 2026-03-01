@@ -116,6 +116,49 @@ function getFinalStream(url, maxRedirects = 5) {
   });
 }
 
+async function resumeRadioStream(guildId, guildStates) {
+  const state = guildStates.get(guildId);
+  if (!state) return false;
+  if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
+    return false;
+  }
+
+  const channelInfo = state.lastPlayedRadioInfo ||
+    (state.lastPlayedRadioKey ? radioChannels[state.lastPlayedRadioKey] : null);
+
+  if (!channelInfo?.url) {
+    return false;
+  }
+
+  clearTimeout(state.timeoutId);
+
+  if (!state.player) {
+    state.player = createAudioPlayer();
+    state.playerListenersAttached = false;
+  }
+
+  if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
+    state.connection.subscribe(state.player);
+  }
+
+  try {
+    const res = await getFinalStream(channelInfo.url);
+    const resource = createAudioResource(res);
+
+    state.currentSourceType = 'radio';
+    state.isAnnouncementPlaying = false;
+    state.resumeRadioAfterAnnouncement = false;
+    state.player.play(resource);
+    return true;
+  } catch (err) {
+    console.error(`[Radio] Failed to resume stream for guild ${guildId}:`, err.message);
+    state.currentSourceType = null;
+    state.isAnnouncementPlaying = false;
+    state.resumeRadioAfterAnnouncement = false;
+    return false;
+  }
+}
+
 // channelOrKey can be:
 //  - string: key in radioChannels
 //  - object: { name, url } from FMStream
@@ -175,16 +218,17 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
       playerListenersAttached: false,
       nowPlayingRadioMsgId: null,
       lastPlayedRadioKey: null,
+      lastPlayedRadioInfo: null,
+      announcementIntervalId: null,
+      isAnnouncementPlaying: false,
+      resumeRadioAfterAnnouncement: false,
     };
     guildStates.set(guildId, state);
   }
 
   state.textChannel = interaction.channel;
-  if (channelKey) {
-    state.lastPlayedRadioKey = channelKey;
-  } else {
-    state.lastPlayedRadioKey = null;
-  }
+  state.lastPlayedRadioKey = channelKey || null;
+  state.lastPlayedRadioInfo = { ...channelInfo };
   clearTimeout(state.timeoutId);
 
   // Delete previous now-playing message
@@ -381,6 +425,7 @@ function disableComponents(components) {
 module.exports = {
   radioChannels,
   playRadioStream,
+  resumeRadioStream,
   showRadioInterface,
   disableComponents,
 };

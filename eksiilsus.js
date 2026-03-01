@@ -7,8 +7,13 @@ const {
   getVoiceConnection,
   VoiceConnectionStatus,
   AudioPlayerStatus,
+  StreamType,
+  createAudioResource,
   entersState
 } = require('@discordjs/voice');
+const fs = require('fs');
+const path = require('path');
+const prism = require('prism-media');
 
 const radio = require('./radio');
 const youtube = require('./yt');
@@ -56,6 +61,9 @@ const client = new Client({
 
 const prefix = process.env.PREFIX || '!';
 const token = process.env.TOKEN;
+const announcementFolder = path.join(__dirname, 'audio', 'announcements');
+const announcementIntervalMs = Number(process.env.ANNOUNCEMENT_INTERVAL_MS || 3_600_000);
+const announcementExtensions = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
 
 const guildStates = new Collection();
 
@@ -136,6 +144,26 @@ client.on(Events.MessageCreate, async (message) => {
     await youtube.showQueue(message, guildStates);
     return;
   }
+
+  if (command === 'announce' || command === 'testannounce' || command === 'reklaam' ) {
+    const state = guildStates.get(guildId);
+    if (!state || state.currentSourceType !== 'radio') {
+      await message.reply('Testteavitus tootab ainult siis, kui raadio juba mangib.');
+      return;
+    }
+
+    const played = await playAnnouncementClip(guildId, guildStates, { force: true });
+    if (played) {
+    } else {
+      const files = getAnnouncementFiles();
+      if (files.length === 0) {
+        await message.reply('Kaustas `audio/announcements` ei ole uhtegi toetatud helifaili.');
+      } else {
+        await message.reply('Teavitust ei saanud mangida. Kaivita raadio esmalt ja veendu, et bot on haalekanalis.');
+      }
+    }
+    return;
+  }
 });
 
 // ----------------------------------------------------------------------
@@ -193,7 +221,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const country = customId.split(':')[1];
       const style = interaction.values[0];
 
-      await showStationMenu(interaction, country, style);
+      await showStationMenu(interaction, country, style, guildStates);
       return;
     }
 
@@ -297,6 +325,78 @@ function attachListeners(guildId) {
     setupGuildPlayerListeners(guildId, guildStates);
     state.playerListenersAttached = true;
   }
+
+  ensureAnnouncementScheduler(guildId, guildStates);
+}
+
+function getAnnouncementFiles() {
+  try {
+    return fs.readdirSync(announcementFolder, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && announcementExtensions.has(path.extname(entry.name).toLowerCase()))
+      .map((entry) => path.join(announcementFolder, entry.name));
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error('[Announcements] Failed to read announcement folder:', error.message);
+    }
+    return [];
+  }
+}
+
+function clearAnnouncementScheduler(state) {
+  if (state?.announcementIntervalId) {
+    clearInterval(state.announcementIntervalId);
+    state.announcementIntervalId = null;
+  }
+}
+
+function ensureAnnouncementScheduler(guildId, states) {
+  const state = states.get(guildId);
+  if (!state) return;
+  if (!Number.isFinite(announcementIntervalMs) || announcementIntervalMs <= 0) return;
+  if (state.announcementIntervalId) return;
+
+  state.announcementIntervalId = setInterval(() => {
+    playAnnouncementClip(guildId, states).catch((error) => {
+      console.error(`[Announcements] Failed for guild ${guildId}:`, error);
+    });
+  }, announcementIntervalMs);
+}
+
+async function playAnnouncementClip(guildId, states, options = {}) {
+  const { force = false } = options;
+  const state = states.get(guildId);
+  if (!state) return false;
+  if (state.isAnnouncementPlaying) return false;
+  if (!force && state.currentSourceType !== 'radio') return false;
+  if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) return false;
+  if (!state.player) return false;
+
+  const files = getAnnouncementFiles();
+  if (files.length === 0) return false;
+
+  const filePath = files[Math.floor(Math.random() * files.length)];
+  const ffmpegStream = new prism.FFmpeg({
+    args: [
+      '-analyzeduration', '0',
+      '-loglevel', '0',
+      '-i', filePath,
+      '-map_metadata', '-1',
+      '-c:a', 'libopus',
+      '-ar', '48000',
+      '-ac', '2',
+      '-f', 'ogg',
+    ],
+  });
+  const resource = createAudioResource(ffmpegStream, { inputType: StreamType.OggOpus });
+
+  state.isAnnouncementPlaying = true;
+  state.resumeRadioAfterAnnouncement = state.currentSourceType === 'radio' &&
+    Boolean(state.lastPlayedRadioInfo || state.lastPlayedRadioKey);
+  state.currentSourceType = 'announcement';
+  clearTimeout(state.timeoutId);
+
+  state.player.play(resource);
+  return true;
 }
 
 // ----------------------------------------------------------------------
@@ -337,7 +437,11 @@ async function stopPlayback(guildId, states, context) {
   }
 
   if (state) {
+    clearAnnouncementScheduler(state);
     clearTimeout(state.timeoutId);
+    state.isAnnouncementPlaying = false;
+    state.resumeRadioAfterAnnouncement = false;
+    state.currentSourceType = null;
     let playerStopped = false;
     if (state.player) {
       if (state.player.state.status !== AudioPlayerStatus.Idle) {
@@ -415,6 +519,24 @@ function setupGuildPlayerListeners(guildId, states) {
     if (!currentState) return;
 
     if (oldState.status === AudioPlayerStatus.Playing) {
+      if (currentState.currentSourceType === 'announcement') {
+        currentState.isAnnouncementPlaying = false;
+
+        if (currentState.resumeRadioAfterAnnouncement) {
+          radio.resumeRadioStream(guildId, states)
+            .then((resumed) => {
+              if (!resumed) {
+                setInactivityTimeout(guildId, states);
+              }
+            })
+            .catch((error) => {
+              console.error(`[Announcements] Could not resume radio for guild ${guildId}:`, error);
+              setInactivityTimeout(guildId, states);
+            });
+          return;
+        }
+      }
+
       if (currentState.currentSourceType === 'youtube' && currentState.queue?.length > 0) {
         youtube.playFromQueue(guildId, states);
       } else {
@@ -429,6 +551,17 @@ function setupGuildPlayerListeners(guildId, states) {
     if (!currentState) return;
 
     console.error(`[Player Error] Guild ${guildId}:`, err.message);
+
+     if (currentState.currentSourceType === 'announcement') {
+      currentState.isAnnouncementPlaying = false;
+      if (currentState.resumeRadioAfterAnnouncement) {
+        radio.resumeRadioStream(guildId, states).catch((resumeError) => {
+          console.error(`[Announcements] Resume failed after player error for guild ${guildId}:`, resumeError);
+          setInactivityTimeout(guildId, states);
+        });
+        return;
+      }
+    }
 
     if (currentState.connection && currentState.connection.state.status !== VoiceConnectionStatus.Destroyed) {
       currentState.connection.destroy();
@@ -468,6 +601,7 @@ function setupGuildConnectionListeners(guildId, states) {
     if (!current) return;
 
     if (current.player) current.player.stop(true);
+    clearAnnouncementScheduler(current);
     clearTimeout(current.timeoutId);
 
     states.delete(guildId);
@@ -496,6 +630,7 @@ function setInactivityTimeout(guildId, states) {
 process.on('SIGINT', () => {
   console.log("Shutting down: Cleaning up connections...");
   guildStates.forEach((state, guildId) => {
+    clearAnnouncementScheduler(state);
     if (state.connection && state.connection.state.status !== 'destroyed') {
       state.connection.destroy();
     }

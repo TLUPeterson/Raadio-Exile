@@ -27,7 +27,11 @@ async function playYouTube(message, args, guildStates) {
          connectionListenersAttached: false,
          playerListenersAttached: false,
          lastPlayedRadioKey: null,
-         nowPlayingRadioMsgId: null
+         lastPlayedRadioInfo: null,
+         nowPlayingRadioMsgId: null,
+         announcementIntervalId: null,
+         isAnnouncementPlaying: false,
+         resumeRadioAfterAnnouncement: false
       };
       guildStates.set(guildId, state);
   }
