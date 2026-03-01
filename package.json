@@ -22,11 +22,9 @@
     "dotenv": "^16.0.3",
     "https": "^1.0.0",
     "node-fetch": "^2.7.0",
-    "play-dl": "^1.9.6",
     "sodium-native": "^5.0.9",
     "spotify-api.js": "^9.2.5",
     "spotify-web-api-node": "^5.0.2",
-    "ytdl-core": "^4.11.5",
-    "ytpl": "^2.3.0"
+    "youtubei.js": "^15.1.1"
   }
 }

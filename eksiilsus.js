@@ -124,6 +124,8 @@ client.on(Events.MessageCreate, async (message) => {
 
   // ----- SPOTIFY (placeholder) -----
   if (command === 'spotify') {
+    await spotify.playSpotify(message, args, guildStates);
+    attachListeners(guildId);
     return;
   }
 
@@ -537,8 +539,17 @@ function setupGuildPlayerListeners(guildId, states) {
         }
       }
 
-      if (currentState.currentSourceType === 'youtube' && currentState.queue?.length > 0) {
-        youtube.playFromQueue(guildId, states);
+      if (currentState.currentSourceType === 'youtube') {
+        if (currentState.queue?.length > 0) {
+          currentState.queue.shift();
+        }
+
+        if (currentState.queue?.length > 0) {
+          youtube.playFromQueue(guildId, states);
+        } else {
+          currentState.currentSourceType = null;
+          setInactivityTimeout(guildId, states);
+        }
       } else {
         currentState.currentSourceType = null;
         setInactivityTimeout(guildId, states);

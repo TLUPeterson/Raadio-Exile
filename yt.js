@@ -1,279 +1,514 @@
-// yt.js (replace your existing module)
 const {
-  joinVoiceChannel, createAudioPlayer, createAudioResource, getVoiceConnection,
-  AudioPlayerStatus, VoiceConnectionStatus, entersState
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  StreamType,
+  entersState,
 } = require('@discordjs/voice');
 const { EmbedBuilder } = require('discord.js');
-const play = require('play-dl');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const prism = require('prism-media');
+const { Innertube, Platform, UniversalCache } = require('youtubei.js');
 
-async function playYouTube(message, args, guildStates) {
-  const voiceChannel = message.member?.voice?.channel;
-  if (!voiceChannel) {
-      return message.reply('Liitu esmalt häälekanaliga!');
-  }
+const execFileAsync = promisify(execFile);
+let innertubePromise = null;
 
+if (typeof Platform?.shim?.eval !== 'function' || String(Platform.shim.eval).includes('throw')) {
+  Platform.shim.eval = (code, env = {}) => {
+    const exportedVars = {};
+    const envAssignments = [];
+
+    if (typeof env.sig === 'string') {
+      envAssignments.push(`sig: exportedVars.sigFunction(${JSON.stringify(env.sig)})`);
+    }
+
+    if (typeof env.nsig === 'string') {
+      envAssignments.push(`nsig: exportedVars.nsigFunction(${JSON.stringify(env.nsig)})`);
+    }
+
+    const wrappedCode = `${code}\nreturn { ${envAssignments.join(', ')} };`;
+    const result = new Function('exportedVars', wrappedCode)(exportedVars);
+
+    if (typeof env.sig === 'string') return result?.sig;
+    if (typeof env.nsig === 'string') return result?.nsig;
+    return result;
+  };
+}
+
+function getOrCreateState(message, guildStates) {
   const guildId = message.guild.id;
-  const query = args.join(' ');
-
   let state = guildStates.get(guildId);
+
   if (!state) {
-      state = {
-         connection: null,
-         player: null,
-         queue: [],
-         currentSourceType: null,
-         textChannel: null,
-         timeoutId: null,
-         connectionListenersAttached: false,
-         playerListenersAttached: false,
-         lastPlayedRadioKey: null,
-         lastPlayedRadioInfo: null,
-         nowPlayingRadioMsgId: null,
-         announcementIntervalId: null,
-         isAnnouncementPlaying: false,
-         resumeRadioAfterAnnouncement: false
-      };
-      guildStates.set(guildId, state);
+    state = {
+      connection: null,
+      player: null,
+      queue: [],
+      currentSourceType: null,
+      textChannel: null,
+      timeoutId: null,
+      connectionListenersAttached: false,
+      playerListenersAttached: false,
+      lastPlayedRadioKey: null,
+      lastPlayedRadioInfo: null,
+      nowPlayingRadioMsgId: null,
+      announcementIntervalId: null,
+      isAnnouncementPlaying: false,
+      resumeRadioAfterAnnouncement: false,
+      currentYtDlpProcess: null,
+    };
+    guildStates.set(guildId, state);
   }
 
   state.textChannel = message.channel;
   clearTimeout(state.timeoutId);
+  return state;
+}
 
-  // Join / ensure connection
+function extractVideoId(input) {
+  if (!input) return null;
+
+  const trimmed = input.trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) return trimmed;
+
   try {
-      // If there's an unusable connection, destroy it and create a new one
-      if (!state.connection || state.connection.state?.status === VoiceConnectionStatus.Destroyed || state.connection.state?.status === VoiceConnectionStatus.Disconnected) {
-          if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) {
-              try { state.connection.destroy(); } catch (_) {}
-          }
+    const url = new URL(trimmed);
+    if (!/youtube\.com$|youtu\.be$/.test(url.hostname)) return null;
 
-          state.connection = joinVoiceChannel({
-              channelId: voiceChannel.id,
-              guildId: guildId,
-              adapterCreator: message.guild.voiceAdapterCreator,
-          });
-          state.connection.rejoinAttempts = 0;
-          state.connectionListenersAttached = false; // main may attach listeners later
-          console.log(`[YT] joinVoiceChannel called for guild ${guildId} (${voiceChannel.name})`);
-      } else if (state.connection.joinConfig && state.connection.joinConfig.channelId !== voiceChannel.id) {
-          return message.reply(`Olen juba teises kanalis (${message.guild.channels.cache.get(state.connection.joinConfig.channelId)?.name}). Liiguta mind või kasuta \`!stop\`.`);
-      }
+    if (url.hostname === 'youtu.be') {
+      return url.pathname.split('/').filter(Boolean)[0] || null;
+    }
 
-      // Wait until Ready
-      await entersState(state.connection, VoiceConnectionStatus.Ready, 20_000);
-  } catch (err) {
-      console.error(`[YT] Error joining/connecting to voice channel for guild ${guildId}:`, err);
-      try { if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) state.connection.destroy(); } catch (_) {}
-      guildStates.delete(guildId);
-      return message.reply('Ei saanud häälekanaliga ühendust luua.');
+    if (url.pathname === '/watch') {
+      return url.searchParams.get('v');
+    }
+
+    const parts = url.pathname.split('/').filter(Boolean);
+    if (parts[0] === 'shorts' || parts[0] === 'live' || parts[0] === 'embed') {
+      return parts[1] || null;
+    }
+  } catch {
+    return null;
   }
 
-  // Search YouTube
+  return null;
+}
+
+function normalizeThumbnail(thumbnails) {
+  if (!Array.isArray(thumbnails) || thumbnails.length === 0) return [];
+  return thumbnails
+    .map((thumbnail) => {
+      if (!thumbnail) return null;
+      if (typeof thumbnail === 'string') return { url: thumbnail };
+      return { url: thumbnail.url || thumbnail[0]?.url || null };
+    })
+    .filter((thumbnail) => thumbnail?.url);
+}
+
+function normalizeVideoFromInfo(info, fallbackUrl) {
+  const basic = info?.basic_info || {};
+  const videoId = basic.id || basic.video_id || extractVideoId(fallbackUrl);
+  if (!videoId) return null;
+
+  return {
+    id: videoId,
+    title: basic.title || 'Unknown title',
+    url: fallbackUrl || `https://www.youtube.com/watch?v=${videoId}`,
+    thumbnails: normalizeThumbnail(basic.thumbnail || basic.thumbnails),
+    durationRaw: basic.duration || basic.duration_text || basic.duration_seconds?.toString() || 'N/A',
+  };
+}
+
+function normalizeSearchVideo(video) {
+  if (!video?.id) return null;
+
+  const title =
+    typeof video.title === 'string'
+      ? video.title
+      : video.title?.text || video.title?.toString?.() || 'Unknown title';
+
+  const durationRaw =
+    video.duration?.text ||
+    video.duration?.toString?.() ||
+    video.duration_text ||
+    video.duration?.seconds?.toString?.() ||
+    'N/A';
+
+  return {
+    id: video.id,
+    title,
+    url: `https://www.youtube.com/watch?v=${video.id}`,
+    thumbnails: normalizeThumbnail(video.thumbnails || video.thumbnail),
+    durationRaw,
+  };
+}
+
+async function getInnertube() {
+  if (!innertubePromise) {
+    const config = {
+      cache: new UniversalCache(false),
+      retrieve_player: true,
+    };
+
+    if (process.env.YOUTUBE_COOKIE) {
+      config.cookie = process.env.YOUTUBE_COOKIE;
+    }
+
+    innertubePromise = Innertube.create(config).catch((error) => {
+      innertubePromise = null;
+      throw error;
+    });
+  }
+
+  return innertubePromise;
+}
+
+async function ensureVoiceConnection(message, guildStates) {
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) {
+    await message.reply('Liitu esmalt haale kanaliga!');
+    return null;
+  }
+
+  const guildId = message.guild.id;
+  const state = getOrCreateState(message, guildStates);
+
   try {
-      await message.react('🔍').catch(()=>{});
-      const searchResults = await play.search(query, { limit: 1, source: { youtube: 'video' } });
-      await message.reactions.removeAll().catch(()=>{});
-
-      if (!searchResults || searchResults.length === 0) {
-          return message.reply('Ei leidnud selle päringuga YouTube videot.');
+    if (
+      !state.connection ||
+      state.connection.state?.status === VoiceConnectionStatus.Destroyed ||
+      state.connection.state?.status === VoiceConnectionStatus.Disconnected
+    ) {
+      if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) {
+        try {
+          state.connection.destroy();
+        } catch (_) {}
       }
-      const video = searchResults[0];
-      addToQueue(message, video, guildId, guildStates);
 
-  } catch (searchErr) {
-      console.error(`[YT] Error searching YouTube for guild ${guildId}:`, searchErr);
-      await message.reactions.removeAll().catch(()=>{});
-      return message.reply('YouTube otsingul tekkis viga.');
+      state.connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+      state.connection.rejoinAttempts = 0;
+      state.connectionListenersAttached = false;
+      console.log(`[YT] joinVoiceChannel called for guild ${guildId} (${voiceChannel.name})`);
+    } else if (state.connection.joinConfig?.channelId !== voiceChannel.id) {
+      await message.reply(
+        `Olen juba teises kanalis (${message.guild.channels.cache.get(state.connection.joinConfig.channelId)?.name}). Liiguta mind voi kasuta \`!stop\`.`
+      );
+      return null;
+    }
+
+    await entersState(state.connection, VoiceConnectionStatus.Ready, 20_000);
+    return { guildId, state };
+  } catch (error) {
+    console.error(`[YT] Error joining/connecting to voice channel for guild ${guildId}:`, error);
+    try {
+      if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) {
+        state.connection.destroy();
+      }
+    } catch (_) {}
+    guildStates.delete(guildId);
+    await message.reply('Ei saanud haale kanaliga ühendust luua.');
+    return null;
   }
 }
 
-function addToQueue(message, video, guildId, guildStates) {
+async function searchFirstVideo(query) {
+  const innertube = await getInnertube();
+  const videoId = extractVideoId(query);
+
+  if (videoId) {
+    const info = await innertube.getBasicInfo(videoId);
+    return normalizeVideoFromInfo(info, `https://www.youtube.com/watch?v=${videoId}`);
+  }
+
+  const search = await innertube.search(query, { type: 'video' });
+  const video = search.videos?.[0] || search.results?.find((result) => result?.id);
+  return normalizeSearchVideo(video);
+}
+
+async function resolveYtDlpStreamUrl(videoUrl) {
+  const { stdout } = await execFileAsync('py', [
+    '-m',
+    'yt_dlp',
+    '--js-runtimes',
+    'node',
+    '-f',
+    'bestaudio/best',
+    '-g',
+    '--no-playlist',
+    videoUrl,
+  ], {
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
+
+  const directUrl = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  if (!directUrl) {
+    throw new Error('yt-dlp did not return a stream URL');
+  }
+
+  return directUrl;
+}
+
+function addToQueue(message, video, guildId, guildStates, options = {}) {
+  const { announce = true } = options;
   const state = guildStates.get(guildId);
-  if (!state) return;
+  if (!state || !video) return false;
 
   state.queue.push(video);
 
-  const queueEmbed = new EmbedBuilder()
+  if (announce) {
+    const queueEmbed = new EmbedBuilder()
       .setColor('#FF0000')
-      .setTitle('Lisatud Järjekorda')
+      .setTitle('Lisatud jarkorda')
       .setDescription(`[${video.title}](${video.url})\nKestus: ${video.durationRaw || 'N/A'}`)
-      .setThumbnail(video.thumbnails?.[0]?.url)
-      .setFooter({ text: `Lisas: ${message.author.tag}`});
+      .setThumbnail(video.thumbnails?.[0]?.url || null)
+      .setFooter({ text: `Lisas: ${message.author.tag}` });
 
-  message.channel.send({ embeds: [queueEmbed] }).catch(console.error);
+    message.channel.send({ embeds: [queueEmbed] }).catch(console.error);
+  }
 
-  // If there's no active youtube playback, start playing
   if (!state.player || state.player.state.status === AudioPlayerStatus.Idle || state.currentSourceType !== 'youtube') {
-      playFromQueue(guildId, guildStates);
+    playFromQueue(guildId, guildStates);
+  }
+
+  return true;
+}
+
+async function queueFromSearch(message, query, guildStates, options = {}) {
+  const connectionInfo = await ensureVoiceConnection(message, guildStates);
+  if (!connectionInfo) return { ok: false, reason: 'voice' };
+
+  try {
+    const video = await searchFirstVideo(query);
+    if (!video) {
+      return { ok: false, reason: 'not_found', query };
+    }
+
+    addToQueue(message, video, connectionInfo.guildId, guildStates, options);
+    return { ok: true, video, query };
+  } catch (error) {
+    console.error(`[YT] Error resolving YouTube video for guild ${connectionInfo.guildId}:`, error);
+    return { ok: false, reason: 'search_error', query, error };
+  }
+}
+
+async function queueMultipleSearches(message, queries, guildStates) {
+  const results = [];
+  for (const query of queries) {
+    const result = await queueFromSearch(message, query, guildStates, { announce: false });
+    results.push(result);
+  }
+  return results;
+}
+
+async function playYouTube(message, args, guildStates) {
+  if (!args.length) {
+    return message.reply("Palun sisesta YouTube'i otsingusona voi link.");
+  }
+
+  try {
+    await message.react('🔍').catch(() => {});
+    const result = await queueFromSearch(message, args.join(' '), guildStates);
+    await message.reactions.removeAll().catch(() => {});
+
+    if (!result.ok) {
+      if (result.reason === 'voice') return;
+      if (result.reason === 'not_found') {
+        return message.reply('Ei leidnud selle paringuga YouTube videot.');
+      }
+      return message.reply('YouTube otsingul tekkis viga.');
+    }
+  } catch (error) {
+    console.error('[YT] Unexpected playYouTube error:', error);
+    await message.reactions.removeAll().catch(() => {});
+    return message.reply('YouTube otsingul tekkis viga.');
   }
 }
 
 async function playFromQueue(guildId, guildStates) {
   const state = guildStates.get(guildId);
   if (!state) {
-      console.log(`[YT Playback] No state for guild ${guildId}`);
-      return;
+    console.log(`[YT Playback] No state for guild ${guildId}`);
+    return;
   }
 
   if (!state.connection || state.connection.state?.status === VoiceConnectionStatus.Destroyed) {
-      console.log(`[YT Playback] No usable connection for guild ${guildId}`);
-      guildStates.delete(guildId);
-      return;
+    console.log(`[YT Playback] No usable connection for guild ${guildId}`);
+    guildStates.delete(guildId);
+    return;
   }
 
-  // Ensure connection is Ready
   try {
-      if (state.connection.state.status !== VoiceConnectionStatus.Ready) {
-          console.log(`[YT Playback] Waiting for connection to be Ready for guild ${guildId}`);
-          await entersState(state.connection, VoiceConnectionStatus.Ready, 15_000);
+    if (state.connection.state.status !== VoiceConnectionStatus.Ready) {
+      console.log(`[YT Playback] Waiting for connection to be Ready for guild ${guildId}`);
+      await entersState(state.connection, VoiceConnectionStatus.Ready, 15_000);
+    }
+  } catch (error) {
+    console.error(`[YT Playback] Connection did not become Ready for guild ${guildId}:`, error);
+    try {
+      if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) {
+        state.connection.destroy();
       }
-  } catch (err) {
-      console.error(`[YT Playback] Connection did not become Ready for guild ${guildId}:`, err);
-      try { if (state.connection && state.connection.state?.status !== VoiceConnectionStatus.Destroyed) state.connection.destroy(); } catch(_) {}
-      guildStates.delete(guildId);
-      return;
+    } catch (_) {}
+    guildStates.delete(guildId);
+    return;
   }
 
   if (!state.queue || state.queue.length === 0) {
-      console.log(`[YT Playback] Queue empty for guild ${guildId}`);
-      state.currentSourceType = null;
+    console.log(`[YT Playback] Queue empty for guild ${guildId}`);
+    state.currentSourceType = null;
+    state.timeoutId = setTimeout(() => {
+      const latestState = guildStates.get(guildId);
+      if (latestState && latestState.connection && latestState.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        const playerIdle = !latestState.player || latestState.player.state.status === AudioPlayerStatus.Idle;
+        const queueEmpty = !latestState.queue || latestState.queue.length === 0;
+        if (playerIdle && queueEmpty) {
+          latestState.textChannel?.send('YouTube jarkord on tuhi, lahkun kanalist passiivsuse tottu.').catch(console.error);
+          try {
+            latestState.connection.destroy();
+          } catch (_) {}
+        }
+        guildStates.delete(guildId);
+      }
+    }, 300_000);
 
-      // set inactivity timeout (fallback)
-      state.timeoutId = setTimeout(() => {
-          const latestState = guildStates.get(guildId);
-          if (latestState && latestState.connection && latestState.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-              const playerIdle = !latestState.player || latestState.player.state.status === AudioPlayerStatus.Idle;
-              const queueEmpty = !latestState.queue || latestState.queue.length === 0;
-              if (playerIdle && queueEmpty) {
-                  latestState.textChannel?.send("YouTube järjekord on tühi, lahkun kanalist passiivsuse tõttu.").catch(console.error);
-                  try { latestState.connection.destroy(); } catch(_) {}
-              }
-              guildStates.delete(guildId);
-          }
-      }, 300_000);
-      if (state.textChannel) state.textChannel.send("YouTube järjekord on tühi.").catch(console.error);
-      return;
+    state.textChannel?.send('YouTube jarkord on tuhi.').catch(console.error);
+    return;
   }
 
-  // Stop other source if necessary
   if (state.player && state.currentSourceType && state.currentSourceType !== 'youtube') {
-      console.log(`[YT Playback] Stopping previous source (${state.currentSourceType}) for guild ${guildId}`);
-      try { state.player.stop(true); } catch(_) {}
+    console.log(`[YT Playback] Stopping previous source (${state.currentSourceType}) for guild ${guildId}`);
+    try {
+      state.player.stop(true);
+    } catch (_) {}
   }
 
   state.currentSourceType = 'youtube';
   const video = state.queue[0];
 
-  // Create player if missing
   if (!state.player) {
-      state.player = createAudioPlayer();
-      state.playerListenersAttached = false;
-      // local minimal listeners so playback won't stall if main listeners aren't attached yet
-      attachLocalPlayerListeners(guildId, guildStates);
-      state.connection.subscribe(state.player);
-      console.log(`[YT Playback] Created and subscribed new player for guild ${guildId}`);
-  } else {
-      // ensure subscription
-      if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
-          state.connection.subscribe(state.player);
-          console.log(`[YT Playback] Resubscribed player for guild ${guildId}`);
-      }
+    state.player = createAudioPlayer();
+    state.playerListenersAttached = false;
+    attachLocalPlayerListeners(guildId, guildStates);
+    state.connection.subscribe(state.player);
+    console.log(`[YT Playback] Created and subscribed new player for guild ${guildId}`);
+  } else if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
+    state.connection.subscribe(state.player);
+    console.log(`[YT Playback] Resubscribed player for guild ${guildId}`);
   }
 
   try {
-      console.log(`[YT Playback] Streaming: ${video.title} (${video.url}) for guild ${guildId}`);
-      const stream = await play.stream(video.url, { quality: 1 }).catch(e => { throw e; });
-      const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    console.log(`[YT Playback] Streaming: ${video.title} (${video.url}) for guild ${guildId}`);
+    const streamUrl = await resolveYtDlpStreamUrl(video.url);
+    const ffmpegStream = new prism.FFmpeg({
+      args: [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-analyzeduration', '0',
+        '-loglevel', '0',
+        '-i', streamUrl,
+        '-map_metadata', '-1',
+        '-c:a', 'libopus',
+        '-ar', '48000',
+        '-ac', '2',
+        '-f', 'ogg',
+      ],
+    });
+    state.currentYtDlpProcess = ffmpegStream;
 
-      state.player.play(resource);
+    const resource = createAudioResource(ffmpegStream, { inputType: StreamType.OggOpus });
+    state.player.play(resource);
 
-      // Wait up to 5s for player to enter Playing state (helps catch errors)
-      try {
-          await entersState(state.player, AudioPlayerStatus.Playing, 5_000);
-          console.log(`[YT Playback] Player now Playing for guild ${guildId}`);
-      } catch (err) {
-          console.warn(`[YT Playback] Player did not enter Playing state in time for guild ${guildId}:`, err?.message || err);
-      }
+    try {
+      await entersState(state.player, AudioPlayerStatus.Playing, 5_000);
+      console.log(`[YT Playback] Player now Playing for guild ${guildId}`);
+    } catch (error) {
+      console.warn(`[YT Playback] Player did not enter Playing state in time for guild ${guildId}:`, error?.message || error);
+    }
 
-      const playingEmbed = new EmbedBuilder()
-          .setColor('#FF0000')
-          .setTitle('Mängib Nüüd (YouTube)')
-          .setDescription(`[${video.title}](${video.url})\nKestus: ${video.durationRaw || 'N/A'}`)
-          .setThumbnail(video.thumbnails?.[0]?.url)
-          .setTimestamp();
+    const playingEmbed = new EmbedBuilder()
+      .setColor('#FF0000')
+      .setTitle('Mangib nuud (YouTube)')
+      .setDescription(`[${video.title}](${video.url})\nKestus: ${video.durationRaw || 'N/A'}`)
+      .setThumbnail(video.thumbnails?.[0]?.url || null)
+      .setTimestamp();
 
-      if (state.textChannel) {
-          state.textChannel.send({ embeds: [playingEmbed] }).catch(console.error);
-      }
-
+    state.textChannel?.send({ embeds: [playingEmbed] }).catch(console.error);
   } catch (error) {
-      console.error(`[YT Playback] Error playing ${video?.title || 'unknown'} for guild ${guildId}:`, error);
-      if (state.textChannel) state.textChannel.send(`Viga video mängimisel: ${error.message || error}`).catch(console.error);
-      // remove failing item and try next
-      state.queue.shift();
-      playFromQueue(guildId, guildStates);
+    console.error(`[YT Playback] Error playing ${video?.title || 'unknown'} for guild ${guildId}:`, error);
+    state.textChannel?.send(`Viga video mangimisel: ${error.message || error}`).catch(console.error);
+    state.queue.shift();
+    playFromQueue(guildId, guildStates);
   }
 }
 
-// Local minimal player listeners (so queue advances even if main's setup hasn't executed)
 function attachLocalPlayerListeners(guildId, guildStates) {
   const state = guildStates.get(guildId);
-  if (!state || !state.player) return;
+  if (!state || !state.player || state._localPlayerListenersAttached) return;
 
-  // Prevent multiple attachments
-  if (state._localPlayerListenersAttached) return;
   state._localPlayerListenersAttached = true;
 
   state.player.on(AudioPlayerStatus.Idle, (oldState) => {
-      const currentState = guildStates.get(guildId);
-      if (!currentState) return;
-      // only advance if previous was Playing
-      if (oldState?.status === AudioPlayerStatus.Playing) {
-          // shift the finished track
-          currentState.queue.shift();
-          // play next if exists
-          if (currentState.queue && currentState.queue.length > 0) {
-              setImmediate(() => playFromQueue(guildId, guildStates));
-          } else {
-              // nothing left — set timeout and clear source
-              currentState.currentSourceType = null;
-              if (currentState.textChannel) currentState.textChannel.send("Järjekord lõppes.").catch(console.error);
-              // inactivity cleanup
-              clearTimeout(currentState.timeoutId);
-              currentState.timeoutId = setTimeout(() => {
-                  const latest = guildStates.get(guildId);
-                  if (latest && latest.connection && latest.connection.state.status !== VoiceConnectionStatus.Destroyed) {
-                      try { latest.connection.destroy(); } catch(_) {}
-                      guildStates.delete(guildId);
-                  }
-              }, 300_000);
-          }
+    const currentState = guildStates.get(guildId);
+    if (!currentState) return;
+
+    currentState.currentYtDlpProcess = null;
+
+    if (oldState?.status === AudioPlayerStatus.Playing) {
+      currentState.queue.shift();
+      if (currentState.queue && currentState.queue.length > 0) {
+        setImmediate(() => playFromQueue(guildId, guildStates));
       } else {
-          console.log(`[YT Local Listener] Idle but previous status not Playing for guild ${guildId} (was ${oldState?.status})`);
+        currentState.currentSourceType = null;
+        currentState.textChannel?.send('Jarkord loppes.').catch(console.error);
+        clearTimeout(currentState.timeoutId);
+        currentState.timeoutId = setTimeout(() => {
+          const latest = guildStates.get(guildId);
+          if (latest && latest.connection && latest.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            try {
+              latest.connection.destroy();
+            } catch (_) {}
+            guildStates.delete(guildId);
+          }
+        }, 300_000);
       }
+    } else {
+      console.log(`[YT Local Listener] Idle but previous status not Playing for guild ${guildId} (was ${oldState?.status})`);
+    }
   });
 
-  state.player.on('error', (err) => {
-      const currentState = guildStates.get(guildId);
-      if (!currentState) return;
-      console.error(`[YT Local Listener] Player error for guild ${guildId}:`, err);
-      currentState.textChannel?.send(`Pleieril viga: ${err.message || err}`).catch(console.error);
-      // try to continue with next track
-      if (currentState.queue && currentState.queue.length > 0) {
-          currentState.queue.shift();
-          setImmediate(() => playFromQueue(guildId, guildStates));
-      } else {
-          // no queue left, cleanup
-          try { currentState.connection?.destroy(); } catch(_) {}
-          guildStates.delete(guildId);
-      }
+  state.player.on('error', (error) => {
+    const currentState = guildStates.get(guildId);
+    if (!currentState) return;
+
+    currentState.currentYtDlpProcess = null;
+    console.error(`[YT Local Listener] Player error for guild ${guildId}:`, error);
+    currentState.textChannel?.send(`Pleieril viga: ${error.message || error}`).catch(console.error);
+
+    if (currentState.queue && currentState.queue.length > 0) {
+      currentState.queue.shift();
+      setImmediate(() => playFromQueue(guildId, guildStates));
+    } else {
+      try {
+        currentState.connection?.destroy();
+      } catch (_) {}
+      guildStates.delete(guildId);
+    }
   });
 
   state.player.on(AudioPlayerStatus.Playing, () => {
-      const currentState = guildStates.get(guildId);
-      if (!currentState) return;
-      clearTimeout(currentState.timeoutId);
-      console.log(`[YT Local Listener] Player started playing (guild ${guildId}).`);
+    const currentState = guildStates.get(guildId);
+    if (!currentState) return;
+    clearTimeout(currentState.timeoutId);
+    console.log(`[YT Local Listener] Player started playing (guild ${guildId}).`);
   });
 }
 
@@ -282,22 +517,25 @@ async function skipSong(message, guildStates) {
   const state = guildStates.get(guildId);
 
   if (!state || !state.player) {
-      return message.reply("Praegu ei mängi midagi.");
+    return message.reply('Praegu ei mangi midagi.');
   }
   if (state.currentSourceType !== 'youtube') {
-      return message.reply("Praegu ei mängi YouTube järjekorda, ei saa vahele jätta.");
+    return message.reply('Praegu ei mangi YouTube jarkorda, ei saa vahele jatta.');
   }
   if (!state.queue || state.queue.length <= 1) {
-       if (!state.queue || state.queue.length === 0){
-           return message.reply("Järjekord on tühi, midagi pole vahele jätta.");
-       } else {
-            return message.reply("Järjekorras pole rohkem laule, mida mängida peale praeguse.");
-       }
+    if (!state.queue || state.queue.length === 0) {
+      return message.reply('Jarkord on tuhi, midagi pole vahele jatta.');
+    }
+    return message.reply('Jarkorras pole rohkem laule peale praeguse.');
   }
 
   const skippedVideo = state.queue[0];
-  message.reply(`Jätan vahele: ${skippedVideo.title}`).catch(console.error);
-  try { state.player.stop(true); } catch(e) { console.error('[skipSong] player.stop error', e); }
+  message.reply(`Jatan vahele: ${skippedVideo.title}`).catch(console.error);
+  try {
+    state.player.stop(true);
+  } catch (error) {
+    console.error('[skipSong] player.stop error', error);
+  }
 }
 
 async function showQueue(message, guildStates) {
@@ -305,24 +543,24 @@ async function showQueue(message, guildStates) {
   const state = guildStates.get(guildId);
 
   if (!state || !state.queue || state.queue.length === 0) {
-      return message.reply("Järjekord on tühi.");
+    return message.reply('Jarkord on tuhi.');
   }
 
   const nowPlaying = state.queue[0];
   const upcoming = state.queue.slice(1, 11);
 
   const embed = new EmbedBuilder()
-      .setColor('#FF0000')
-      .setTitle("Muusika Järjekord")
-      .setDescription(`**Praegu Mängib:**\n[${nowPlaying.title}](${nowPlaying.url}) - ${nowPlaying.durationRaw || 'N/A'}\n\n` +
-                   (upcoming.length > 0
-                       ? `**Järgmisena (${upcoming.length}/${state.queue.length -1}):**\n` +
-                         upcoming.map((video, index) => `${index + 1}. [${video.title}](${video.url}) - ${video.durationRaw || 'N/A'}`).join('\n')
-                       : 'Rohkem laule järjekorras pole.'
-                   ) +
-                   (state.queue.length > 11 ? `\n...ja veel ${state.queue.length - 11} laulu.` : '')
-                  )
-       .setTimestamp();
+    .setColor('#FF0000')
+    .setTitle('Muusika jarkord')
+    .setDescription(
+      `**Praegu mangib:**\n[${nowPlaying.title}](${nowPlaying.url}) - ${nowPlaying.durationRaw || 'N/A'}\n\n` +
+      (upcoming.length > 0
+        ? `**Jargmisena (${upcoming.length}/${state.queue.length - 1}):**\n` +
+          upcoming.map((video, index) => `${index + 1}. [${video.title}](${video.url}) - ${video.durationRaw || 'N/A'}`).join('\n')
+        : 'Rohkem laule jarkorras pole.') +
+      (state.queue.length > 11 ? `\n...ja veel ${state.queue.length - 11} laulu.` : '')
+    )
+    .setTimestamp();
 
   message.channel.send({ embeds: [embed] }).catch(console.error);
 }
@@ -330,6 +568,8 @@ async function showQueue(message, guildStates) {
 module.exports = {
   playYouTube,
   playFromQueue,
+  queueFromSearch,
+  queueMultipleSearches,
   skipSong,
   showQueue,
 };
