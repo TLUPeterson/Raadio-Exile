@@ -13,7 +13,7 @@ const menuMessages = new Map();
 // ----------------------------------------------------------------------
 // MAIN MODE MENU (single persistent menu per channel)
 // ----------------------------------------------------------------------
-async function showMainModeMenu(channel) {
+async function showMainModeMenu(channel, interaction = null) {
   const modeMenu = new StringSelectMenuBuilder()
     .setCustomId('radio_mode')
     .setPlaceholder('Vali kuidas raadiot valida')
@@ -24,6 +24,25 @@ async function showMainModeMenu(channel) {
     ]);
 
   const modeRow = new ActionRowBuilder().addComponents(modeMenu);
+
+  // If we have an interactive update available (e.g. Back button clicked)
+  if (interaction) {
+    try {
+      if (interaction.deferred || interaction.replied) {
+        return interaction.editReply({
+          content: 'Vali uus raadiojaam:',
+          components: [modeRow],
+        });
+      } else {
+        return interaction.update({
+          content: 'Vali uus raadiojaam:',
+          components: [modeRow],
+        });
+      }
+    } catch (e) {
+      console.warn("showMainModeMenu interaction update failed", e);
+    }
+  }
 
   const existingId = menuMessages.get(channel.id);
 
@@ -62,11 +81,19 @@ async function showCountryMenu(interaction) {
     .setPlaceholder('Vali riik')
     .addOptions(options);
 
-  const row = new ActionRowBuilder().addComponents(menu);
+  const menuRow = new ActionRowBuilder().addComponents(menu);
+
+  // Back button
+  const { ButtonBuilder, ButtonStyle } = require('discord.js');
+  const backBtn = new ButtonBuilder()
+    .setCustomId('radio_back_main')
+    .setLabel('Tagasi')
+    .setStyle(ButtonStyle.Secondary);
+  const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
   await interaction.update({
     content: 'Vali riik:',
-    components: [row],
+    components: [menuRow, btnRow],
   });
 }
 
@@ -74,9 +101,6 @@ async function showCountryMenu(interaction) {
 // STYLE MENU
 // ----------------------------------------------------------------------
 async function showStyleMenu(interaction, countryCode) {
-  // styles can be:
-  //  - ["rock", "pop", ...]
-  //  - [{ value: "rock", label: "Rock" }, { value: "30s", label: "thirties" }, ...]
   const styleOptions = styles.slice(0, 25).map(s => {
     if (typeof s === 'string') {
       return {
@@ -103,11 +127,19 @@ async function showStyleMenu(interaction, countryCode) {
     .setPlaceholder('Vali stiil/žanr')
     .addOptions(styleOptions);
 
-  const row = new ActionRowBuilder().addComponents(menu);
+  const menuRow = new ActionRowBuilder().addComponents(menu);
+
+  // Back button -> Needs to go back to Country list
+  const { ButtonBuilder, ButtonStyle } = require('discord.js');
+  const backBtn = new ButtonBuilder()
+    .setCustomId('radio_back_country') // will re-trigger showCountryMenu
+    .setLabel('Tagasi')
+    .setStyle(ButtonStyle.Secondary);
+  const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
   await interaction.update({
     content: `Valitud riik: **${countryCode}**\nVali nüüd stiil/žanr:`,
-    components: [row],
+    components: [menuRow, btnRow],
   });
 }
 
@@ -126,11 +158,19 @@ async function showStationMenu(interaction, countryCode, style) {
   }
 
   const stations = Array.isArray(api?.data) ? api.data : [];
+  const { ButtonBuilder, ButtonStyle } = require('discord.js');
 
   if (!stations.length) {
+    // Back button even on error/empty
+    const backBtn = new ButtonBuilder()
+      .setCustomId(`radio_back_style:${countryCode}`)
+      .setLabel('Tagasi')
+      .setStyle(ButtonStyle.Secondary);
+    const btnRow = new ActionRowBuilder().addComponents(backBtn);
+
     return interaction.update({
       content: `❌ Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${style}**.\nProovi teist stiili.`,
-      components: [],
+      components: [btnRow],
     });
   }
 
@@ -149,11 +189,19 @@ async function showStationMenu(interaction, countryCode, style) {
     .setPlaceholder('Vali jaam')
     .addOptions(stationOptions);
 
-  const row = new ActionRowBuilder().addComponents(menu);
+  const menuRow = new ActionRowBuilder().addComponents(menu);
+
+  // Back button -> Needs to go back to Style list
+  // We need countryCode for that. Storing it in customId is easiest.
+  const backBtn = new ButtonBuilder()
+    .setCustomId(`radio_back_style:${countryCode}`)
+    .setLabel('Tagasi')
+    .setStyle(ButtonStyle.Secondary);
+  const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
   await interaction.update({
     content: `Vali jaam (**${countryCode}**, stiil: ${style}):`,
-    components: [row],
+    components: [menuRow, btnRow],
   });
 }
 

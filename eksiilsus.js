@@ -13,7 +13,22 @@ const {
 const radio = require('./radio');
 const youtube = require('./yt');
 const spotify = require('./spotify');
+const { generateDependencyReport } = require('@discordjs/voice');
 
+console.log("--- Dependency Report ---");
+try { console.log(generateDependencyReport()); } catch (e) { console.log("Failed to generate report", e); }
+console.log("-------------------------");
+
+console.log("Attempting to require @snazzah/davey...");
+try {
+  require('@snazzah/davey');
+  console.log("Success: @snazzah/davey loaded.");
+} catch (e) {
+  console.error("FAIL: Could not load @snazzah/davey:", e);
+}
+
+// Force pkg to include these:
+try { require('sodium-native'); console.log("sodium-native loaded"); } catch (e) { console.error("sodium-native failed", e); }
 const {
   showMainModeMenu,
   showCountryMenu,
@@ -49,6 +64,18 @@ client.once(Events.ClientReady, c => {
   guildStates.clear();
 });
 
+client.on(Events.Error, error => {
+  console.error('[Client Error]', error);
+});
+
+process.on('unhandledRejection', error => {
+  console.error('[Unhandled Rejection]', error);
+});
+
+process.on('uncaughtException', error => {
+  console.error('[Uncaught Exception]', error);
+});
+
 // ----------------------------------------------------------------------
 // MESSAGE COMMANDS
 // ----------------------------------------------------------------------
@@ -78,7 +105,7 @@ client.on(Events.MessageCreate, async (message) => {
       try {
         const msg = await stateForYt.textChannel.messages.fetch(stateForYt.nowPlayingRadioMsgId);
         await msg.delete();
-      } catch (e) {}
+      } catch (e) { }
       stateForYt.nowPlayingRadioMsgId = null;
     }
 
@@ -175,7 +202,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await pickStation(interaction, guildStates);
       attachListeners(guildId);
 
-      await showMainModeMenu(interaction.channel);
+      // PERSISTENCE: Do NOT go back to main menu.
+      // await showMainModeMenu(interaction.channel);
       return;
     }
 
@@ -184,16 +212,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const selectedChannelKey = interaction.values[0];
 
       if (radio.radioChannels[selectedChannelKey]) {
+        // Immediate defer to prevent timeout
+        await interaction.deferUpdate();
+
         radio.playRadioStream(interaction, selectedChannelKey, guildStates);
         attachListeners(guildId);
 
-        try {
-          await interaction.message.edit({
-            components: radio.disableComponents(interaction.message.components)
-          });
-        } catch (e) {}
-
-        await showMainModeMenu(interaction.channel);
+        // PERSISTENCE: keeping the menu active, so user can pick another one.
+        // DO NOT call showMainModeMenu(interaction.channel);
         return;
       }
     }
@@ -203,14 +229,38 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (interaction.isButton()) {
     const id = interaction.customId;
 
+    // --- BACK NAVIGATION ---
+    if (id === 'radio_back_main') {
+      // Pass interaction so it can update directly without deferring first if possible
+      // or handle it if we passed it.
+      await showMainModeMenu(interaction.channel, interaction);
+      return;
+    }
+
+    if (id === 'radio_back_country') {
+      // Back to Country request
+      await showCountryMenu(interaction);
+      return;
+    }
+
+    if (id.startsWith('radio_back_style:')) {
+      const countryCode = id.split(':')[1];
+      await showStyleMenu(interaction, countryCode);
+      return;
+    }
+
+
     if (id === 'radio_stop') {
       await stopPlayback(guildId, guildStates, interaction);
-      try {
-        await interaction.message.edit({
-          components: radio.disableComponents(interaction.message.components)
-        });
-      } catch (e) {}
-      await showMainModeMenu(interaction.channel);
+      // PERSISTENCE: Do NOT disable components. Let user play again.
+      // try {
+      //   await interaction.message.edit({
+      //     components: radio.disableComponents(interaction.message.components)
+      //   });
+      // } catch (e) {}
+
+      // Do NOT go back to main menu automatically
+      // await showMainModeMenu(interaction.channel);
       return;
     }
 
@@ -219,16 +269,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (radioKeys.length > 0) {
         const key = radioKeys[Math.floor(Math.random() * radioKeys.length)];
+        await interaction.deferUpdate();
         radio.playRadioStream(interaction, key, guildStates);
         attachListeners(guildId);
 
-        try {
-          await interaction.message.edit({
-            components: radio.disableComponents(interaction.message.components)
-          });
-        } catch (e) {}
-
-        await showMainModeMenu(interaction.channel);
+        // PERSISTENCE: Keep menu active
         return;
       }
     }

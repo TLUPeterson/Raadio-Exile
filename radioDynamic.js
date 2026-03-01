@@ -107,6 +107,9 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
 
 // STEP 5: user picks a specific station
 async function pickStation(interaction, guildStates) {
+  // Immediate defer to prevent "Interaction failed"
+  await interaction.deferUpdate();
+
   const stationId = interaction.values[0];
 
   // cached by showStationMenu()
@@ -144,8 +147,7 @@ async function pickStation(interaction, guildStates) {
     { name: station.program, url: stream },
     guildStates
   );
-
-  await interaction.deferUpdate();
+  // Defer is already done at start
 }
 
 // Random worldwide station (c=RD)
