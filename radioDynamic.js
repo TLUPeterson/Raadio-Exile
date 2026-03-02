@@ -1,8 +1,64 @@
 const { ActionRowBuilder, StringSelectMenuBuilder } = require('discord.js');
 const { fmstream } = require('./fmstream');
 const countries = require('./data/countries');
-const styles = require('./data/styles');
 const radio = require('./radio');
+const {
+  RANDOM_STYLE_LABEL,
+  RANDOM_STYLE_VALUE,
+  getAvailableStyleChoices,
+  getStationsForCountryStyle,
+  getStyleLabel,
+  resolveRandomStyle,
+} = require('./styleAvailability');
+const MAX_SELECT_OPTIONS = 25;
+const FEATURED_COUNTRY_CODES = [
+  'EE',
+  'US',
+  'FI',
+  'AF',
+  'AU',
+  'CD',
+  'FR',
+  'DE',
+  'IN',
+  'IR',
+  'IQ',
+  'IE',
+  'IL',
+  'IT',
+  'JM',
+  'JP',
+  'KP',
+  'KR',
+  'SE',
+  'UG',
+  'UA',
+  'AE',
+  'GB',
+];
+
+function getCountryName(countryCode) {
+  return countries.find((country) => country.code === countryCode)?.name || countryCode;
+}
+
+function getFeaturedCountries() {
+  const countryByCode = new Map(countries.map((country) => [country.code, country]));
+  return FEATURED_COUNTRY_CODES
+    .map((code) => countryByCode.get(code))
+    .filter(Boolean);
+}
+
+async function respondToInteraction(interaction, payload) {
+  if (interaction.isStringSelectMenu?.() || interaction.isButton?.()) {
+    return interaction.update(payload);
+  }
+
+  if (interaction.deferred || interaction.replied) {
+    return interaction.editReply(payload);
+  }
+
+  return interaction.reply({ ...payload, flags: 64 });
+}
 
 function getOrCreateState(interaction, guildStates) {
   let state = guildStates.get(interaction.guildId);
@@ -35,7 +91,7 @@ async function showCountryMenu(interaction) {
     .setCustomId('radio_country')
     .setPlaceholder('Vali riik')
     .addOptions(
-      countries.map((country) => ({
+      getFeaturedCountries().slice(0, MAX_SELECT_OPTIONS).map((country) => ({
         label: country.name,
         value: country.code,
       }))
@@ -48,49 +104,85 @@ async function showCountryMenu(interaction) {
 }
 
 async function showStyleMenu(interaction, countryCode) {
+  const styleOptions = await getAvailableStyleChoices(countryCode, {
+    limit: MAX_SELECT_OPTIONS,
+    includeRandom: true,
+    maxProbes: 24,
+  });
   const menu = new StringSelectMenuBuilder()
     .setCustomId(`radio_style:${countryCode}`)
     .setPlaceholder('Vali stiil/zhanr')
-    .addOptions(styles);
+    .addOptions(styleOptions);
 
-  await interaction.update({
-    content: `Valitud riik: **${countryCode}**\nVali nuud stiil/zhanr:`,
+  await respondToInteraction(interaction, {
+    content: `Valitud riik: **${getCountryName(countryCode)}**\nVali nuud stiil/zhanr:`,
     components: [new ActionRowBuilder().addComponents(menu)],
   });
 }
 
 async function showStationMenu(interaction, countryCode, style, guildStates) {
-  let api;
+  let resolvedStyle = style;
+  let stations = [];
+
   try {
-    api = await fmstream({ c: countryCode, style, hq: 1 });
+    if (style === RANDOM_STYLE_VALUE) {
+      const randomMatch = await resolveRandomStyle(countryCode);
+      if (!randomMatch) {
+        const styleOptions = await getAvailableStyleChoices(countryCode, {
+          limit: MAX_SELECT_OPTIONS,
+          includeRandom: true,
+          maxProbes: 24,
+        });
+        return respondToInteraction(interaction, {
+          content: `Riigile **${getCountryName(countryCode)}** ei leidunud juhuslikku toimivat stiili.`,
+          components: [new ActionRowBuilder().addComponents(
+            new StringSelectMenuBuilder()
+              .setCustomId(`radio_style:${countryCode}`)
+              .setPlaceholder('Vali muu stiil/zhanr')
+              .addOptions(styleOptions)
+          )],
+        });
+      }
+
+      resolvedStyle = randomMatch.style.value;
+      stations = randomMatch.stations;
+    } else {
+      stations = await getStationsForCountryStyle(countryCode, style);
+    }
   } catch (error) {
     console.error('[FMStream] Error fetching stations:', error);
-    return interaction.update({
+    return respondToInteraction(interaction, {
       content: 'Tekkis viga jaamade parimisel. Proovi uuesti.',
       components: [],
     });
   }
 
-  if (!api.data || api.data.length === 0) {
+  if (!stations.length) {
+    const styleOptions = await getAvailableStyleChoices(countryCode, {
+      limit: MAX_SELECT_OPTIONS,
+      includeRandom: true,
+      maxProbes: 24,
+    });
     const styleMenu = new StringSelectMenuBuilder()
       .setCustomId(`radio_style:${countryCode}`)
       .setPlaceholder('Vali muu stiil/zhanr')
-      .addOptions(styles);
+      .addOptions(styleOptions);
 
-    return interaction.update({
-      content: `Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${style}**.\nVali moni muu stiil:`,
+    return respondToInteraction(interaction, {
+      content: `Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${getStyleLabel(resolvedStyle)}**.\nVali moni muu stiil:`,
       components: [new ActionRowBuilder().addComponents(styleMenu)],
     });
   }
 
   const state = getOrCreateState(interaction, guildStates);
-  state.stationSearch = {
+  state.stationSearches ??= new Map();
+  state.stationSearches.set(interaction.user.id, {
     country: countryCode,
-    style,
-    stations: api.data,
-  };
+    style: resolvedStyle,
+    stations,
+  });
 
-  const stations = api.data.slice(0, 25).map((station) => ({
+  const stationOptions = stations.slice(0, 25).map((station) => ({
     label: station.program.slice(0, 80),
     description: (station.description || 'Kirjeldus puudub').slice(0, 90),
     value: String(station.id),
@@ -99,10 +191,10 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
   const menu = new StringSelectMenuBuilder()
     .setCustomId('radio_station_pick')
     .setPlaceholder('Vali jaam')
-    .addOptions(stations);
+    .addOptions(stationOptions);
 
-  await interaction.update({
-    content: `Vali jaam (**${countryCode}**, stiil: ${style}):`,
+  await respondToInteraction(interaction, {
+    content: `Vali jaam (**${getCountryName(countryCode)}**, stiil: ${getStyleLabel(resolvedStyle)}):`,
     components: [new ActionRowBuilder().addComponents(menu)],
   });
 }
@@ -112,7 +204,7 @@ async function pickStation(interaction, guildStates) {
 
   const state = guildStates.get(interaction.guildId);
   const stationId = interaction.values[0];
-  const cache = state?.stationSearch?.stations;
+  const cache = state?.stationSearches?.get(interaction.user.id)?.stations;
 
   if (!cache) {
     return interaction.followUp({
@@ -194,4 +286,6 @@ module.exports = {
   showStationMenu,
   pickStation,
   playRandomWorld,
+  RANDOM_STYLE_LABEL,
+  RANDOM_STYLE_VALUE,
 };

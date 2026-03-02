@@ -1,6 +1,43 @@
 const https = require('https');
 const { URLSearchParams } = require('url');
 
+const fmstreamCountryAliases = {
+  AE: 'ARE',
+  AF: 'AFG',
+  AT: 'AUT',
+  AU: 'AUS',
+  BE: 'BEL',
+  CH: 'SUI',
+  CD: 'COD',
+  DE: 'D',
+  DK: 'DNK',
+  EE: 'EST',
+  ES: 'E',
+  FI: 'FIN',
+  FR: 'FRA',
+  GB: 'GBR',
+  IE: 'IRL',
+  IL: 'ISR',
+  IN: 'IND',
+  IQ: 'IRQ',
+  IR: 'IRN',
+  IT: 'ITA',
+  JM: 'JAM',
+  KP: 'PRK',
+  KR: 'KOR',
+  NL: 'HOL',
+  NO: 'NOR',
+  PT: 'POR',
+  SE: 'SWE',
+  UA: 'UKR',
+  UG: 'UGA',
+  US: 'USA',
+};
+
+function normalizeCountryCode(code) {
+  return fmstreamCountryAliases[code] || code;
+}
+
 function fmstreamFetch(url) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
@@ -9,7 +46,7 @@ function fmstreamFetch(url) {
       res.on('end', () => {
         // Attempt to parse JSON, but handle non-JSON responses gracefully
         try {
-          const trimmed = data.trim();
+          const trimmed = data.trim().replace(/^null+/, '');
           if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
             resolve(JSON.parse(trimmed));
           } else {
@@ -32,6 +69,9 @@ async function fmstream(params = {}) {
 
   const unix = Math.floor(Date.now() / 1000);
   let qsParams = { ...params };
+  if (qsParams.c) {
+    qsParams.c = normalizeCountryCode(qsParams.c);
+  }
   if (keya && keyb) {
     // Helper to parse potential hex or decimal
     const parseKey = (val) => {

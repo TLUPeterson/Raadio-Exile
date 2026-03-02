@@ -18,7 +18,9 @@ const prism = require('prism-media');
 const radio = require('./radio');
 const youtube = require('./yt');
 const spotify = require('./spotify');
+const countries = require('./data/countries');
 const { generateDependencyReport } = require('@discordjs/voice');
+const { getAvailableStyleChoices } = require('./styleAvailability');
 
 console.log("--- Dependency Report ---");
 try { console.log(generateDependencyReport()); } catch (e) { console.log("Failed to generate report", e); }
@@ -37,13 +39,13 @@ try { require('sodium-native'); console.log("sodium-native loaded"); } catch (e)
 const {
   showMainModeMenu,
   showCountryMenu,
-  showStyleMenu,
-  showStationMenu
+  showStyleMenu
 } = require('./ui');
 
 const {
+  showStationMenu,
   pickStation,
-  playRandomWorld
+  playRandomWorld,
 } = require('./radioDynamic');
 
 require('dotenv').config();
@@ -66,10 +68,75 @@ const announcementIntervalMs = Number(process.env.ANNOUNCEMENT_INTERVAL_MS || 3_
 const announcementExtensions = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
 
 const guildStates = new Collection();
+const radioSlashCommands = [
+  {
+    name: 'radio',
+    description: 'Otsi raadiojaamu riigi ja stiili jargi',
+    options: [
+      {
+        type: 3,
+        name: 'country',
+        description: 'Riik',
+        required: true,
+        autocomplete: true,
+      },
+      {
+        type: 3,
+        name: 'style',
+        description: 'Stiil voi zhanr',
+        required: true,
+        autocomplete: true,
+      },
+    ],
+  },
+];
 
-client.once(Events.ClientReady, c => {
+function filterAutocompleteChoices(options, focusedValue, toChoice) {
+  const query = String(focusedValue || '').trim().toLowerCase();
+
+  const choices = options
+    .map((option) => toChoice(option))
+    .filter((choice) => {
+      if (!query) return true;
+      return choice.name.toLowerCase().includes(query) || choice.value.toLowerCase().includes(query);
+    });
+
+  return choices.slice(0, 25);
+}
+
+async function registerGuildSlashCommands(clientInstance) {
+  for (const guild of clientInstance.guilds.cache.values()) {
+    try {
+      const existingCommands = await guild.commands.fetch();
+
+      for (const commandData of radioSlashCommands) {
+        const existingCommand = existingCommands.find((command) => command.name === commandData.name);
+        if (existingCommand) {
+          await existingCommand.edit(commandData);
+        } else {
+          await guild.commands.create(commandData);
+        }
+      }
+    } catch (error) {
+      console.error(`[Slash Commands] Failed to register for guild ${guild.id}:`, error);
+    }
+  }
+}
+
+client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}!`);
   guildStates.clear();
+  await registerGuildSlashCommands(c);
+});
+
+client.on(Events.GuildCreate, async (guild) => {
+  try {
+    for (const commandData of radioSlashCommands) {
+      await guild.commands.create(commandData);
+    }
+  } catch (error) {
+    console.error(`[Slash Commands] Failed to register for new guild ${guild.id}:`, error);
+  }
 });
 
 client.on(Events.Error, error => {
@@ -176,6 +243,54 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.guildId || !interaction.channel) return;
 
   const guildId = interaction.guildId;
+
+  if (interaction.isAutocomplete() && interaction.commandName === 'radio') {
+    const focused = interaction.options.getFocused(true);
+
+    if (focused.name === 'country') {
+      const choices = filterAutocompleteChoices(
+        countries,
+        focused.value,
+        (country) => ({
+          name: String(country.name),
+          value: String(country.code),
+        })
+      );
+      await interaction.respond(choices);
+      return;
+    }
+
+    if (focused.name === 'style') {
+      const country = interaction.options.getString('country');
+      if (!country) {
+        await interaction.respond([]);
+        return;
+      }
+
+      const choices = await getAvailableStyleChoices(country, {
+        limit: 25,
+        query: focused.value,
+        includeRandom: true,
+        maxProbes: 8,
+      });
+
+      await interaction.respond(
+        choices.map((choice) => ({
+          name: choice.label,
+          value: choice.value,
+        }))
+      );
+      return;
+    }
+  }
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'radio') {
+    const country = interaction.options.getString('country', true);
+    const style = interaction.options.getString('style', true);
+
+    await showStationMenu(interaction, country, style, guildStates);
+    return;
+  }
 
   // STRING SELECT MENUS
   if (interaction.isStringSelectMenu()) {
