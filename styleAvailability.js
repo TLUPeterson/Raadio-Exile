@@ -2,9 +2,32 @@ const { fmstream } = require('./fmstream');
 
 const RANDOM_STYLE_LABEL = 'Random';
 const RANDOM_STYLE_VALUE = '__random__';
+const COUNTRY_CACHE_TTL_MS = 30 * 60 * 1000;
 const countryCache = new Map();
 
+function isExpired(expiresAt) {
+  return Number.isFinite(expiresAt) && expiresAt <= Date.now();
+}
+
+function pruneCountryCache() {
+  for (const [countryCode, cache] of countryCache.entries()) {
+    if (cache.pendingStations || cache.pendingStyleStations.size > 0) {
+      continue;
+    }
+
+    if (isExpired(cache.expiresAt)) {
+      countryCache.delete(countryCode);
+    }
+  }
+}
+
+function touchCountryCache(cache) {
+  cache.expiresAt = Date.now() + COUNTRY_CACHE_TTL_MS;
+}
+
 function getCountryCache(countryCode) {
+  pruneCountryCache();
+
   let cache = countryCache.get(countryCode);
   if (!cache) {
     cache = {
@@ -13,10 +36,12 @@ function getCountryCache(countryCode) {
       pendingStations: null,
       stationsByStyle: new Map(),
       pendingStyleStations: new Map(),
+      expiresAt: Date.now() + COUNTRY_CACHE_TTL_MS,
     };
     countryCache.set(countryCode, cache);
   }
 
+  touchCountryCache(cache);
   return cache;
 }
 
@@ -82,6 +107,7 @@ async function getCountryStations(countryCode) {
       const stations = Array.isArray(api?.data) ? api.data : [];
       cache.stations = stations;
       cache.styles = buildStylesFromStations(stations);
+      touchCountryCache(cache);
       return stations;
     } finally {
       cache.pendingStations = null;
@@ -116,6 +142,7 @@ async function getStationsForCountryStyle(countryCode, styleValue) {
       const api = await fmstream({ c: countryCode, style: styleValue, hq: 1, o: 'top' });
       const stations = Array.isArray(api?.data) ? api.data : [];
       cache.stationsByStyle.set(styleValue, stations);
+      touchCountryCache(cache);
       return stations;
     } finally {
       cache.pendingStyleStations.delete(styleValue);
@@ -184,6 +211,7 @@ function getStyleLabel(styleValue) {
 module.exports = {
   RANDOM_STYLE_LABEL,
   RANDOM_STYLE_VALUE,
+  COUNTRY_CACHE_TTL_MS,
   getAvailableStyleChoices,
   getCountryStations,
   getCountryStyles,

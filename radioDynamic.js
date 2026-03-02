@@ -11,6 +11,7 @@ const {
   resolveRandomStyle,
 } = require('./styleAvailability');
 const MAX_SELECT_OPTIONS = 25;
+const STATION_SEARCH_TTL_MS = 15 * 60 * 1000;
 const FEATURED_COUNTRY_CODES = [
   'EE',
   'US',
@@ -48,6 +49,19 @@ function getFeaturedCountries() {
     .filter(Boolean);
 }
 
+function pruneStationSearches(state) {
+  if (!state?.stationSearches) {
+    return;
+  }
+
+  const now = Date.now();
+  for (const [userId, entry] of state.stationSearches.entries()) {
+    if (!entry || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
+      state.stationSearches.delete(userId);
+    }
+  }
+}
+
 async function respondToInteraction(interaction, payload) {
   if (interaction.isStringSelectMenu?.() || interaction.isButton?.()) {
     return interaction.update(payload);
@@ -82,6 +96,7 @@ function getOrCreateState(interaction, guildStates) {
     guildStates.set(interaction.guildId, state);
   }
 
+  pruneStationSearches(state);
   state.textChannel = interaction.channel;
   return state;
 }
@@ -180,6 +195,7 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
     country: countryCode,
     style: resolvedStyle,
     stations,
+    expiresAt: Date.now() + STATION_SEARCH_TTL_MS,
   });
 
   const stationOptions = stations.slice(0, 25).map((station) => ({
@@ -203,6 +219,7 @@ async function pickStation(interaction, guildStates) {
   await interaction.deferUpdate();
 
   const state = guildStates.get(interaction.guildId);
+  pruneStationSearches(state);
   const stationId = interaction.values[0];
   const cache = state?.stationSearches?.get(interaction.user.id)?.stations;
 
@@ -288,4 +305,5 @@ module.exports = {
   playRandomWorld,
   RANDOM_STYLE_LABEL,
   RANDOM_STYLE_VALUE,
+  STATION_SEARCH_TTL_MS,
 };

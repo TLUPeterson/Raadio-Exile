@@ -66,6 +66,8 @@ const token = process.env.TOKEN;
 const announcementFolder = path.join(__dirname, 'audio', 'announcements');
 const announcementIntervalMs = Number(process.env.ANNOUNCEMENT_INTERVAL_MS || 3_600_000);
 const announcementExtensions = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
+const MINUTE_MS = 60_000;
+const GUILD_STATE_PRUNE_INTERVAL_MS = 10 * 60_000;
 
 const guildStates = new Collection();
 const radioSlashCommands = [
@@ -430,6 +432,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // ----------------------------------------------------------------------
 
 function attachListeners(guildId) {
+  pruneGuildStates(guildStates);
   const state = guildStates.get(guildId);
   if (!state) return;
 
@@ -444,6 +447,41 @@ function attachListeners(guildId) {
   }
 
   ensureAnnouncementScheduler(guildId, guildStates);
+}
+
+function isConnectionActive(connection) {
+  if (!connection) return false;
+  return connection.state.status !== VoiceConnectionStatus.Destroyed;
+}
+
+function isPlayerActive(player, currentSourceType) {
+  if (!player) return false;
+  if (currentSourceType === 'radio' || currentSourceType === 'announcement') {
+    return true;
+  }
+
+  return player.state.status !== AudioPlayerStatus.Idle;
+}
+
+function isGuildStateDisposable(state) {
+  if (!state) return true;
+  if (isConnectionActive(state.connection)) return false;
+  if (isPlayerActive(state.player, state.currentSourceType)) return false;
+  if (state.announcementIntervalId) return false;
+  if (state.timeoutId) return false;
+  if (state.isAnnouncementPlaying) return false;
+  if (state.resumeRadioAfterAnnouncement) return false;
+  if (state.queue?.length) return false;
+  if (state.currentSourceType) return false;
+  return true;
+}
+
+function pruneGuildStates(states) {
+  for (const [guildId, state] of states.entries()) {
+    if (isGuildStateDisposable(state)) {
+      states.delete(guildId);
+    }
+  }
 }
 
 function getAnnouncementFiles() {
@@ -461,9 +499,50 @@ function getAnnouncementFiles() {
 
 function clearAnnouncementScheduler(state) {
   if (state?.announcementIntervalId) {
-    clearInterval(state.announcementIntervalId);
+    clearTimeout(state.announcementIntervalId);
     state.announcementIntervalId = null;
   }
+}
+
+function getAlignedAnnouncementDelayMs(intervalMs, now = new Date()) {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    return null;
+  }
+
+  if (intervalMs % MINUTE_MS !== 0) {
+    return intervalMs;
+  }
+
+  const midnight = new Date(now);
+  midnight.setHours(0, 0, 0, 0);
+  const elapsedTodayMs = now.getTime() - midnight.getTime();
+  const remainder = elapsedTodayMs % intervalMs;
+  let delayMs = remainder === 0 ? intervalMs : intervalMs - remainder;
+  if (delayMs <= 0) {
+    delayMs = intervalMs;
+  }
+
+  return delayMs;
+}
+
+function scheduleNextAnnouncement(guildId, states) {
+  const state = states.get(guildId);
+  if (!state) return;
+  if (!Number.isFinite(announcementIntervalMs) || announcementIntervalMs <= 0) return;
+
+  clearAnnouncementScheduler(state);
+
+  const delayMs = getAlignedAnnouncementDelayMs(announcementIntervalMs);
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return;
+
+  state.nextAnnouncementAt = Date.now() + delayMs;
+  state.announcementIntervalId = setTimeout(() => {
+    playAnnouncementClip(guildId, states).catch((error) => {
+      console.error(`[Announcements] Failed for guild ${guildId}:`, error);
+    }).finally(() => {
+      scheduleNextAnnouncement(guildId, states);
+    });
+  }, delayMs);
 }
 
 function ensureAnnouncementScheduler(guildId, states) {
@@ -472,11 +551,7 @@ function ensureAnnouncementScheduler(guildId, states) {
   if (!Number.isFinite(announcementIntervalMs) || announcementIntervalMs <= 0) return;
   if (state.announcementIntervalId) return;
 
-  state.announcementIntervalId = setInterval(() => {
-    playAnnouncementClip(guildId, states).catch((error) => {
-      console.error(`[Announcements] Failed for guild ${guildId}:`, error);
-    });
-  }, announcementIntervalMs);
+  scheduleNextAnnouncement(guildId, states);
 }
 
 async function playAnnouncementClip(guildId, states, options = {}) {
@@ -765,6 +840,10 @@ process.on('SIGINT', () => {
   console.log("Client destroyed. Exiting.");
   process.exit(0);
 });
+
+setInterval(() => {
+  pruneGuildStates(guildStates);
+}, GUILD_STATE_PRUNE_INTERVAL_MS);
 
 process.on('exit', (code) => {
   console.log(`Process exited with code: ${code}`);

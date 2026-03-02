@@ -10,6 +10,7 @@ const { fmstream } = require('./fmstream');
 const { getAvailableStyleChoices } = require('./styleAvailability');
 
 const menuMessages = new Map();
+const MENU_MESSAGE_TTL_MS = 6 * 60 * 60 * 1000;
 const FEATURED_COUNTRY_CODES = [
   'EE',
   'US',
@@ -36,6 +37,15 @@ const FEATURED_COUNTRY_CODES = [
   'GB',
 ];
 
+function pruneMenuMessages() {
+  const now = Date.now();
+  for (const [channelId, entry] of menuMessages.entries()) {
+    if (!entry || !Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) {
+      menuMessages.delete(channelId);
+    }
+  }
+}
+
 function getFeaturedCountries() {
   const countryByCode = new Map(countries.map((country) => [country.code, country]));
   return FEATURED_COUNTRY_CODES
@@ -44,6 +54,8 @@ function getFeaturedCountries() {
 }
 
 async function showMainModeMenu(channel, interaction = null) {
+  pruneMenuMessages();
+
   const modeMenu = new StringSelectMenuBuilder()
     .setCustomId('radio_mode')
     .setPlaceholder('Vali kuidas raadiot valida')
@@ -78,7 +90,10 @@ async function showMainModeMenu(channel, interaction = null) {
     components: [modeRow],
   });
 
-  menuMessages.set(channel.id, message.id);
+  menuMessages.set(channel.id, {
+    id: message.id,
+    expiresAt: Date.now() + MENU_MESSAGE_TTL_MS,
+  });
 }
 
 async function showCountryMenu(interaction) {
