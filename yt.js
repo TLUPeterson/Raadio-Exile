@@ -20,8 +20,47 @@ const execFileAsync = promisify(execFile);
 let innertubePromise = null;
 const pythonCommand = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3');
 
+function getYouTubeCookieFilePath() {
+  const cookieFile = process.env.YOUTUBE_COOKIE_FILE?.trim();
+  if (!cookieFile) return null;
+  return path.resolve(cookieFile);
+}
+
+function getYouTubeCookieString() {
+  const cookieFile = getYouTubeCookieFilePath();
+  if (cookieFile && fs.existsSync(cookieFile)) {
+    const fileContents = fs.readFileSync(cookieFile, 'utf8');
+    const pairs = [];
+
+    for (const line of fileContents.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+
+      const parts = trimmed.split('\t');
+      if (parts.length >= 7) {
+        const name = parts[5];
+        const value = parts.slice(6).join('\t');
+        if (name) {
+          pairs.push(`${name}=${value}`);
+        }
+      }
+    }
+
+    if (pairs.length > 0) {
+      return pairs.join('; ');
+    }
+  }
+
+  return process.env.YOUTUBE_COOKIE?.trim() || null;
+}
+
 function buildYtDlpCookieFile() {
-  const cookieString = process.env.YOUTUBE_COOKIE?.trim();
+  const existingCookieFile = getYouTubeCookieFilePath();
+  if (existingCookieFile && fs.existsSync(existingCookieFile)) {
+    return existingCookieFile;
+  }
+
+  const cookieString = getYouTubeCookieString();
   if (!cookieString) return null;
 
   const lines = [
@@ -187,7 +226,7 @@ async function getInnertube() {
     };
 
     if (process.env.YOUTUBE_COOKIE) {
-      config.cookie = process.env.YOUTUBE_COOKIE;
+      config.cookie = getYouTubeCookieString();
     }
 
     innertubePromise = Innertube.create(config).catch((error) => {
