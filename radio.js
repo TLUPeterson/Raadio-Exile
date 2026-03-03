@@ -214,6 +214,7 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
       currentSourceType: null,
       textChannel: null,
       timeoutId: null,
+      emptyChannelTimeoutId: null,
       connectionListenersAttached: false,
       playerListenersAttached: false,
       nowPlayingRadioMsgId: null,

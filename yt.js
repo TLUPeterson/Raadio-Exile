@@ -122,6 +122,7 @@ function getOrCreateState(message, guildStates) {
       currentSourceType: null,
       textChannel: null,
       timeoutId: null,
+      emptyChannelTimeoutId: null,
       connectionListenersAttached: false,
       playerListenersAttached: false,
       lastPlayedRadioKey: null,

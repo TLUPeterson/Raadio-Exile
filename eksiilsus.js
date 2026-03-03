@@ -68,6 +68,7 @@ const announcementIntervalMs = Number(process.env.ANNOUNCEMENT_INTERVAL_MS || 3_
 const announcementExtensions = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
 const MINUTE_MS = 60_000;
 const GUILD_STATE_PRUNE_INTERVAL_MS = 10 * 60_000;
+const EMPTY_CHANNEL_DISCONNECT_MS = Number(process.env.EMPTY_CHANNEL_DISCONNECT_MS || 15 * MINUTE_MS);
 
 const guildStates = new Collection();
 const radioSlashCommands = [
@@ -85,7 +86,7 @@ const radioSlashCommands = [
       {
         type: 3,
         name: 'style',
-        description: 'Stiil voi zhanr',
+        description: 'Stiil voi zanr',
         required: true,
         autocomplete: true,
       },
@@ -143,6 +144,12 @@ client.on(Events.GuildCreate, async (guild) => {
 
 client.on(Events.Error, error => {
   console.error('[Client Error]', error);
+});
+
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  const guildId = newState.guild?.id || oldState.guild?.id;
+  if (!guildId) return;
+  refreshEmptyChannelTimeout(guildId, guildStates);
 });
 
 process.on('unhandledRejection', error => {
@@ -447,6 +454,7 @@ function attachListeners(guildId) {
   }
 
   ensureAnnouncementScheduler(guildId, guildStates);
+  refreshEmptyChannelTimeout(guildId, guildStates);
 }
 
 function isConnectionActive(connection) {
@@ -469,11 +477,70 @@ function isGuildStateDisposable(state) {
   if (isPlayerActive(state.player, state.currentSourceType)) return false;
   if (state.announcementIntervalId) return false;
   if (state.timeoutId) return false;
+  if (state.emptyChannelTimeoutId) return false;
   if (state.isAnnouncementPlaying) return false;
   if (state.resumeRadioAfterAnnouncement) return false;
   if (state.queue?.length) return false;
   if (state.currentSourceType) return false;
   return true;
+}
+
+function getVoiceChannelForState(guildId, states) {
+  const state = states.get(guildId);
+  const channelId = state?.connection?.joinConfig?.channelId;
+  if (!channelId) return null;
+
+  const guild = client.guilds.cache.get(guildId);
+  const channel = guild?.channels?.cache?.get(channelId);
+  return channel?.isVoiceBased?.() ? channel : null;
+}
+
+function getHumanListenerCount(guildId, states) {
+  const voiceChannel = getVoiceChannelForState(guildId, states);
+  if (!voiceChannel) return 0;
+  return voiceChannel.members.filter((member) => !member.user?.bot).size;
+}
+
+function clearEmptyChannelTimeout(state) {
+  if (!state?.emptyChannelTimeoutId) return;
+  clearTimeout(state.emptyChannelTimeoutId);
+  state.emptyChannelTimeoutId = null;
+}
+
+function refreshEmptyChannelTimeout(guildId, states) {
+  const state = states.get(guildId);
+  if (!state) return;
+
+  if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
+    clearEmptyChannelTimeout(state);
+    return;
+  }
+
+  if (getHumanListenerCount(guildId, states) > 0) {
+    clearEmptyChannelTimeout(state);
+    return;
+  }
+
+  if (state.emptyChannelTimeoutId) return;
+
+  state.emptyChannelTimeoutId = setTimeout(() => {
+    const currentState = states.get(guildId);
+    if (!currentState) return;
+    currentState.emptyChannelTimeoutId = null;
+
+    if (!currentState.connection || currentState.connection.state.status === VoiceConnectionStatus.Destroyed) {
+      return;
+    }
+
+    if (getHumanListenerCount(guildId, states) > 0) {
+      return;
+    }
+
+    try {
+      currentState.connection.destroy();
+    } catch (_) {}
+    states.delete(guildId);
+  }, EMPTY_CHANNEL_DISCONNECT_MS);
 }
 
 function pruneGuildStates(states) {
@@ -631,6 +698,7 @@ async function stopPlayback(guildId, states, context) {
   if (state) {
     clearAnnouncementScheduler(state);
     clearTimeout(state.timeoutId);
+    clearEmptyChannelTimeout(state);
     state.isAnnouncementPlaying = false;
     state.resumeRadioAfterAnnouncement = false;
     state.currentSourceType = null;
@@ -804,6 +872,7 @@ function setupGuildConnectionListeners(guildId, states) {
     if (current.player) current.player.stop(true);
     clearAnnouncementScheduler(current);
     clearTimeout(current.timeoutId);
+    clearEmptyChannelTimeout(current);
 
     states.delete(guildId);
   });
@@ -832,6 +901,7 @@ process.on('SIGINT', () => {
   console.log("Shutting down: Cleaning up connections...");
   guildStates.forEach((state, guildId) => {
     clearAnnouncementScheduler(state);
+    clearEmptyChannelTimeout(state);
     if (state.connection && state.connection.state.status !== 'destroyed') {
       state.connection.destroy();
     }
