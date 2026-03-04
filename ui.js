@@ -12,29 +12,30 @@ const { getAvailableStyleChoices } = require('./styleAvailability');
 const menuMessages = new Map();
 const MENU_MESSAGE_TTL_MS = 6 * 60 * 60 * 1000;
 const FEATURED_COUNTRY_CODES = [
-  'EE',
-  'US',
-  'FI',
-  'AF',
-  'AU',
-  'CD',
-  'FR',
-  'DE',
-  'IN',
-  'IR',
-  'IQ',
-  'IE',
-  'IL',
-  'IT',
-  'JM',
-  'JP',
-  'KP',
-  'KR',
-  'SE',
-  'UG',
-  'UA',
-  'AE',
-  'GB',
+  'EST',
+  'USA',
+  'FIN',
+  'AFG',
+  'AUS',
+  'COD',
+  'F',
+  'D',
+  'IND',
+  'IRN',
+  'IRQ',
+  'IRL',
+  'ISR',
+  'I',
+  'JMC',
+  'J',
+  'KRE',
+  'KOR',
+  'LAO',
+  'S',
+  'UGA',
+  'UKR',
+  'UAE',
+  'G',
 ];
 
 function pruneMenuMessages() {
@@ -51,6 +52,10 @@ function getFeaturedCountries() {
   return FEATURED_COUNTRY_CODES
     .map((code) => countryByCode.get(code))
     .filter(Boolean);
+}
+
+function getCountryName(countryCode) {
+  return countries.find((country) => country.code === countryCode)?.name || countryCode;
 }
 
 async function showMainModeMenu(channel, interaction = null) {
@@ -144,7 +149,7 @@ async function showStyleMenu(interaction, countryCode) {
   const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
   await interaction.editReply({
-    content: `Valitud riik: **${countryCode}**\nVali nuud stiil/zhanr:`,
+    content: `Valitud riik: **${getCountryName(countryCode)}**\nVali nuud stiil/zhanr:`,
     components: [menuRow, btnRow],
   });
 }
@@ -169,7 +174,7 @@ async function showStationMenu(interaction, countryCode, style) {
     const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
     return interaction.update({
-      content: `Jaamu ei leitud riigile **${countryCode}** ja stiiliga **${style}**.\nProovi teist stiili.`,
+      content: `Jaamu ei leitud riigile **${getCountryName(countryCode)}** ja stiiliga **${style}**.\nProovi teist stiili.`,
       components: [btnRow],
     });
   }
@@ -196,7 +201,7 @@ async function showStationMenu(interaction, countryCode, style) {
   const btnRow = new ActionRowBuilder().addComponents(backBtn);
 
   await interaction.update({
-    content: `Vali jaam (**${countryCode}**, stiil: ${style}):`,
+    content: `Vali jaam (**${getCountryName(countryCode)}**, stiil: ${style}):`,
     components: [menuRow, btnRow],
   });
 }
