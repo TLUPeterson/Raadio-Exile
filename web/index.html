@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Raadio Exile</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="login" class="login-screen hidden">
+    <div class="login-card">
+      <div class="brand-mark">R</div>
+      <p class="eyebrow">RAADIO EXILE</p>
+      <h1>Your stations,<br>one quiet control room.</h1>
+      <p class="muted">Sign in with Discord to control radio bots in servers you belong to.</p>
+      <a id="loginButton" class="button primary" href="/auth/login">Continue with Discord</a>
+      <p id="loginHint" class="tiny"></p>
+    </div>
+  </div>
+
+  <div id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand"><div class="brand-mark">R</div><div><strong>Raadio</strong><span>Exile control</span></div></div>
+      <nav>
+        <a class="active" href="#overview">Overview</a>
+        <a href="#stations">Stations</a>
+        <a href="#favorites">Favorites</a>
+        <a href="#history">History</a>
+      </nav>
+      <div class="sidebar-foot"><span class="live-dot"></span> Pool connected</div>
+    </aside>
+
+    <main>
+      <header>
+        <div><p class="eyebrow">CONTROL ROOM</p><h1>Radio overview</h1></div>
+        <div class="header-actions">
+          <select id="guildSelect" aria-label="Discord server"></select>
+          <span id="userName"></span>
+          <form method="post" action="/auth/logout"><button class="icon-button" title="Log out">↗</button></form>
+        </div>
+      </header>
+
+      <section id="overview">
+        <div class="section-heading"><div><p class="eyebrow">BOT POOL</p><h2>Live status</h2></div><span id="lastUpdated" class="muted"></span></div>
+        <div id="botGrid" class="bot-grid"></div>
+      </section>
+
+      <div class="content-grid">
+        <section id="stations" class="panel station-panel">
+          <div class="section-heading"><div><p class="eyebrow">DISCOVER</p><h2>Find a station</h2></div></div>
+          <div class="search-grid">
+            <select id="countrySelect" aria-label="Country"></select>
+            <input id="styleInput" placeholder="Style, e.g. rock">
+            <input id="stationQuery" placeholder="Station name">
+            <button id="searchButton" class="button neutral">Search</button>
+          </div>
+          <div class="channel-row"><label for="voiceChannelSelect">Play in</label><select id="voiceChannelSelect"></select></div>
+          <div id="stationList" class="station-list"></div>
+        </section>
+
+        <section id="favorites" class="panel favorites-panel">
+          <div class="section-heading"><div><p class="eyebrow">SAVED</p><h2>Favorites</h2></div><span id="favoriteCount" class="count"></span></div>
+          <div id="favoriteList" class="compact-list"></div>
+        </section>
+      </div>
+
+      <section id="history" class="panel history-panel">
+        <div class="section-heading"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>Listening history</h2></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Station</th><th>Channel</th><th>Source</th><th>Played</th><th></th></tr></thead><tbody id="historyBody"></tbody></table></div>
+      </section>
+      <div id="toast" role="status" aria-live="polite"></div>
+    </main>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

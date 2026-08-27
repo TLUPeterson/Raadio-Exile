@@ -14,11 +14,10 @@ const os = require('os');
 const path = require('path');
 const { promisify } = require('util');
 const prism = require('prism-media');
-const { Innertube, Platform, UniversalCache } = require('youtubei.js');
 
 const execFileAsync = promisify(execFile);
-let innertubePromise = null;
 const pythonCommand = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'py' : 'python3');
+const ytDlpTimeoutMs = Number(process.env.YTDLP_TIMEOUT_MS) || 60_000;
 
 function getYouTubeCookieFilePath() {
   const cookieFile = process.env.YOUTUBE_COOKIE_FILE?.trim();
@@ -57,7 +56,7 @@ function getYouTubeCookieString() {
 function buildYtDlpCookieFile() {
   const existingCookieFile = getYouTubeCookieFilePath();
   if (existingCookieFile && fs.existsSync(existingCookieFile)) {
-    return existingCookieFile;
+    return { filePath: existingCookieFile, temporary: false };
   }
 
   const cookieString = getYouTubeCookieString();
@@ -85,29 +84,35 @@ function buildYtDlpCookieFile() {
 
   const filePath = path.join(os.tmpdir(), `raadio-exile-ytdlp-cookies-${process.pid}.txt`);
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
-  return filePath;
+  return { filePath, temporary: true };
 }
 
-if (typeof Platform?.shim?.eval !== 'function' || String(Platform.shim.eval).includes('throw')) {
-  Platform.shim.eval = (code, env = {}) => {
-    const exportedVars = {};
-    const envAssignments = [];
+async function runYtDlp(args) {
+  const cookieFile = buildYtDlpCookieFile();
+  const fullArgs = [
+    '-m',
+    'yt_dlp',
+    '--js-runtimes',
+    process.env.YTDLP_JS_RUNTIME || 'node',
+  ];
 
-    if (typeof env.sig === 'string') {
-      envAssignments.push(`sig: exportedVars.sigFunction(${JSON.stringify(env.sig)})`);
+  if (cookieFile) {
+    fullArgs.push('--cookies', cookieFile.filePath);
+  }
+
+  fullArgs.push(...args);
+
+  try {
+    return await execFileAsync(pythonCommand, fullArgs, {
+      windowsHide: true,
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: ytDlpTimeoutMs,
+    });
+  } finally {
+    if (cookieFile?.temporary) {
+      fs.rmSync(cookieFile.filePath, { force: true });
     }
-
-    if (typeof env.nsig === 'string') {
-      envAssignments.push(`nsig: exportedVars.nsigFunction(${JSON.stringify(env.nsig)})`);
-    }
-
-    const wrappedCode = `${code}\nreturn { ${envAssignments.join(', ')} };`;
-    const result = new Function('exportedVars', wrappedCode)(exportedVars);
-
-    if (typeof env.sig === 'string') return result?.sig;
-    if (typeof env.nsig === 'string') return result?.nsig;
-    return result;
-  };
+  }
 }
 
 function getOrCreateState(message, guildStates) {
@@ -149,9 +154,11 @@ function extractVideoId(input) {
 
   try {
     const url = new URL(trimmed);
-    if (!/youtube\.com$|youtu\.be$/.test(url.hostname)) return null;
+    const hostname = url.hostname.toLowerCase();
+    const isYouTubeHost = hostname === 'youtube.com' || hostname.endsWith('.youtube.com');
+    if (!isYouTubeHost && hostname !== 'youtu.be') return null;
 
-    if (url.hostname === 'youtu.be') {
+    if (hostname === 'youtu.be') {
       return url.pathname.split('/').filter(Boolean)[0] || null;
     }
 
@@ -181,62 +188,35 @@ function normalizeThumbnail(thumbnails) {
     .filter((thumbnail) => thumbnail?.url);
 }
 
-function normalizeVideoFromInfo(info, fallbackUrl) {
-  const basic = info?.basic_info || {};
-  const videoId = basic.id || basic.video_id || extractVideoId(fallbackUrl);
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return 'N/A';
+
+  const rounded = Math.round(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainingSeconds = rounded % 60;
+
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
+    : `${minutes}:${String(remainingSeconds).padStart(2, '0')}`;
+}
+
+function normalizeVideoFromYtDlp(info, fallbackUrl) {
+  const videoId = info?.id || extractVideoId(fallbackUrl);
   if (!videoId) return null;
+
+  const thumbnails = normalizeThumbnail(info.thumbnails);
+  if (info.thumbnail && !thumbnails.some((thumbnail) => thumbnail.url === info.thumbnail)) {
+    thumbnails.unshift({ url: info.thumbnail });
+  }
 
   return {
     id: videoId,
-    title: basic.title || 'Unknown title',
-    url: fallbackUrl || `https://www.youtube.com/watch?v=${videoId}`,
-    thumbnails: normalizeThumbnail(basic.thumbnail || basic.thumbnails),
-    durationRaw: basic.duration || basic.duration_text || basic.duration_seconds?.toString() || 'N/A',
+    title: info.title || 'Unknown title',
+    url: info.webpage_url || fallbackUrl || `https://www.youtube.com/watch?v=${videoId}`,
+    thumbnails,
+    durationRaw: info.duration_string || formatDuration(info.duration),
   };
-}
-
-function normalizeSearchVideo(video) {
-  if (!video?.id) return null;
-
-  const title =
-    typeof video.title === 'string'
-      ? video.title
-      : video.title?.text || video.title?.toString?.() || 'Unknown title';
-
-  const durationRaw =
-    video.duration?.text ||
-    video.duration?.toString?.() ||
-    video.duration_text ||
-    video.duration?.seconds?.toString?.() ||
-    'N/A';
-
-  return {
-    id: video.id,
-    title,
-    url: `https://www.youtube.com/watch?v=${video.id}`,
-    thumbnails: normalizeThumbnail(video.thumbnails || video.thumbnail),
-    durationRaw,
-  };
-}
-
-async function getInnertube() {
-  if (!innertubePromise) {
-    const config = {
-      cache: new UniversalCache(false),
-      retrieve_player: true,
-    };
-
-    if (process.env.YOUTUBE_COOKIE) {
-      config.cookie = getYouTubeCookieString();
-    }
-
-    innertubePromise = Innertube.create(config).catch((error) => {
-      innertubePromise = null;
-      throw error;
-    });
-  }
-
-  return innertubePromise;
 }
 
 async function ensureVoiceConnection(message, guildStates) {
@@ -292,54 +272,52 @@ async function ensureVoiceConnection(message, guildStates) {
 }
 
 async function searchFirstVideo(query) {
-  const innertube = await getInnertube();
   const videoId = extractVideoId(query);
+  const target = videoId
+    ? `https://www.youtube.com/watch?v=${videoId}`
+    : `ytsearch1:${query}`;
+  const selectionArgs = videoId
+    ? ['--no-playlist']
+    : ['--flat-playlist', '--playlist-end', '1'];
+  const { stdout } = await runYtDlp([
+    ...selectionArgs,
+    '--skip-download',
+    '--dump-json',
+    '--',
+    target,
+  ]);
 
-  if (videoId) {
-    const info = await innertube.getBasicInfo(videoId);
-    return normalizeVideoFromInfo(info, `https://www.youtube.com/watch?v=${videoId}`);
-  }
+  const jsonLine = stdout.split(/\r?\n/).find((line) => line.trim());
+  if (!jsonLine) return null;
 
-  const search = await innertube.search(query, { type: 'video' });
-  const video = search.videos?.[0] || search.results?.find((result) => result?.id);
-  return normalizeSearchVideo(video);
+  return normalizeVideoFromYtDlp(JSON.parse(jsonLine), videoId ? target : null);
 }
 
-async function resolveYtDlpStreamUrl(videoUrl) {
-  const args = [
-    '-m',
-    'yt_dlp',
-    '--js-runtimes',
-    'node',
+async function resolveYtDlpStream(videoUrl) {
+  const { stdout } = await runYtDlp([
     '-f',
     'bestaudio/best',
-    '-g',
+    '--dump-single-json',
     '--no-playlist',
+    '--',
     videoUrl,
-  ];
+  ]);
+  const info = JSON.parse(stdout.trim());
 
-  const cookieFile = buildYtDlpCookieFile();
-  if (cookieFile) {
-    args.splice(4, 0, '--cookies', cookieFile);
+  if (!info.url) {
+    throw new Error('yt-dlp did not return a stream URL');
   }
 
-  try {
-    const { stdout } = await execFileAsync(pythonCommand, args, {
-      windowsHide: true,
-      maxBuffer: 1024 * 1024,
-    });
+  return { url: info.url, httpHeaders: info.http_headers || {} };
+}
 
-    const directUrl = stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
-    if (!directUrl) {
-      throw new Error('yt-dlp did not return a stream URL');
-    }
+function buildFfmpegHeaderArgs(httpHeaders) {
+  const serializedHeaders = Object.entries(httpHeaders || {})
+    .filter(([name, value]) => name && value != null)
+    .map(([name, value]) => `${String(name).replace(/[\r\n:]/g, '')}: ${String(value).replace(/[\r\n]/g, '')}\r\n`)
+    .join('');
 
-    return directUrl;
-  } finally {
-    if (cookieFile) {
-      fs.rmSync(cookieFile, { force: true });
-    }
-  }
+  return serializedHeaders ? ['-headers', serializedHeaders] : [];
 }
 
 function addToQueue(message, video, guildId, guildStates, options = {}) {
@@ -485,14 +463,14 @@ async function playFromQueue(guildId, guildStates) {
     attachLocalPlayerListeners(guildId, guildStates);
     state.connection.subscribe(state.player);
     console.log(`[YT Playback] Created and subscribed new player for guild ${guildId}`);
-  } else if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
+  } else if (!state.connection.state.subscription || state.connection.state.subscription.player !== state.player) {
     state.connection.subscribe(state.player);
     console.log(`[YT Playback] Resubscribed player for guild ${guildId}`);
   }
 
   try {
     console.log(`[YT Playback] Streaming: ${video.title} (${video.url}) for guild ${guildId}`);
-    const streamUrl = await resolveYtDlpStreamUrl(video.url);
+    const stream = await resolveYtDlpStream(video.url);
     const ffmpegStream = new prism.FFmpeg({
       args: [
         '-reconnect', '1',
@@ -500,7 +478,8 @@ async function playFromQueue(guildId, guildStates) {
         '-reconnect_delay_max', '5',
         '-analyzeduration', '0',
         '-loglevel', '0',
-        '-i', streamUrl,
+        ...buildFfmpegHeaderArgs(stream.httpHeaders),
+        '-i', stream.url,
         '-map_metadata', '-1',
         '-c:a', 'libopus',
         '-ar', '48000',

@@ -6,6 +6,7 @@ const {
   RANDOM_STYLE_LABEL,
   RANDOM_STYLE_VALUE,
   getAvailableStyleChoices,
+  getStationsForCountrySearch,
   getStationsForCountryStyle,
   getStyleLabel,
   resolveRandomStyle,
@@ -63,13 +64,25 @@ function pruneStationSearches(state) {
   }
 }
 
-async function respondToInteraction(interaction, payload) {
-  if (interaction.isStringSelectMenu?.() || interaction.isButton?.()) {
-    return interaction.update(payload);
-  }
+function formatStationDescription(station) {
+  const parts = [
+    station.style,
+    station.country,
+    station.description,
+  ]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean);
 
+  return (parts.join(' - ') || 'Kirjeldus puudub').slice(0, 100);
+}
+
+async function respondToInteraction(interaction, payload) {
   if (interaction.deferred || interaction.replied) {
     return interaction.editReply(payload);
+  }
+
+  if (interaction.isStringSelectMenu?.() || interaction.isButton?.()) {
+    return interaction.update(payload);
   }
 
   return interaction.reply({ ...payload, flags: 64 });
@@ -136,12 +149,28 @@ async function showStyleMenu(interaction, countryCode) {
   });
 }
 
-async function showStationMenu(interaction, countryCode, style, guildStates) {
+async function showStationMenu(interaction, countryCode, style, guildStates, options = {}) {
+  const stationSearch = String(options.stationSearch || '').trim();
+
+  if (!interaction.deferred && !interaction.replied) {
+    if (interaction.isChatInputCommand?.()) {
+      await interaction.deferReply({ flags: 64 }).catch(() => {});
+    } else if (interaction.deferUpdate) {
+      await interaction.deferUpdate().catch(() => {});
+    }
+  }
+
   let resolvedStyle = style;
   let stations = [];
 
   try {
-    if (style === RANDOM_STYLE_VALUE) {
+    if (stationSearch) {
+      stations = await getStationsForCountrySearch(
+        countryCode,
+        stationSearch,
+        style && style !== RANDOM_STYLE_VALUE ? style : ''
+      );
+    } else if (style === RANDOM_STYLE_VALUE) {
       const randomMatch = await resolveRandomStyle(countryCode);
       if (!randomMatch) {
         const styleOptions = await getAvailableStyleChoices(countryCode, {
@@ -174,6 +203,13 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
   }
 
   if (!stations.length) {
+    if (stationSearch) {
+      return respondToInteraction(interaction, {
+        content: `Jaamu ei leitud riigile **${getCountryName(countryCode)}** otsinguga **${stationSearch}**.`,
+        components: [],
+      });
+    }
+
     const styleOptions = await getAvailableStyleChoices(countryCode, {
       limit: MAX_SELECT_OPTIONS,
       includeRandom: true,
@@ -195,13 +231,14 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
   state.stationSearches.set(interaction.user.id, {
     country: countryCode,
     style: resolvedStyle,
+    stationSearch,
     stations,
     expiresAt: Date.now() + STATION_SEARCH_TTL_MS,
   });
 
   const stationOptions = stations.slice(0, 25).map((station) => ({
     label: station.program.slice(0, 80),
-    description: (station.description || 'Kirjeldus puudub').slice(0, 90),
+    description: formatStationDescription(station),
     value: String(station.id),
   }));
 
@@ -211,7 +248,9 @@ async function showStationMenu(interaction, countryCode, style, guildStates) {
     .addOptions(stationOptions);
 
   await respondToInteraction(interaction, {
-    content: `Vali jaam (**${getCountryName(countryCode)}**, stiil: ${getStyleLabel(resolvedStyle)}):`,
+    content: stationSearch
+      ? `Vali jaam (**${getCountryName(countryCode)}**, otsing: ${stationSearch}${resolvedStyle ? `, stiil: ${getStyleLabel(resolvedStyle)}` : ''}):`
+      : `Vali jaam (**${getCountryName(countryCode)}**, stiil: ${getStyleLabel(resolvedStyle)}):`,
     components: [new ActionRowBuilder().addComponents(menu)],
   });
 }

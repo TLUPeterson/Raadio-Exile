@@ -1,5 +1,7 @@
 const https = require('https');
-const { URLSearchParams } = require('url');
+const { URL, URLSearchParams } = require('url');
+
+const MAX_REDIRECTS = 3;
 
 const fmstreamCountryAliases = {
   AE: 'UAE',
@@ -45,9 +47,40 @@ function normalizeCountryCode(code) {
   return fmstreamCountryAliases[code] || code;
 }
 
-function fmstreamFetch(url) {
+function redactUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.searchParams.has('key')) {
+    parsed.searchParams.set('key', 'REDACTED');
+  }
+  return parsed.toString();
+}
+
+function fmstreamFetch(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        res.resume();
+
+        if (!res.headers.location) {
+          reject(new Error(`fmstream redirected without a Location header (HTTP ${res.statusCode})`));
+          return;
+        }
+
+        if (redirectCount >= MAX_REDIRECTS) {
+          reject(new Error('Too many redirects from fmstream'));
+          return;
+        }
+
+        const redirectUrl = new URL(res.headers.location, url);
+        if (redirectUrl.protocol !== 'https:') {
+          reject(new Error(`Refusing non-HTTPS redirect from fmstream: ${redirectUrl.protocol}`));
+          return;
+        }
+
+        resolve(fmstreamFetch(redirectUrl.toString(), redirectCount + 1));
+        return;
+      }
+
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
@@ -57,8 +90,13 @@ function fmstreamFetch(url) {
           if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
             resolve(JSON.parse(trimmed));
           } else {
-            console.warn('[fmstream] Received non-JSON response:', trimmed.slice(0, 200));
-            reject(new Error('Non-JSON response from fmstream'));
+            const contentType = res.headers['content-type'] || 'unknown content type';
+            console.warn('[fmstream] Received non-JSON response:', {
+              statusCode: res.statusCode,
+              contentType,
+              body: trimmed.slice(0, 200),
+            });
+            reject(new Error(`Non-JSON response from fmstream (HTTP ${res.statusCode}, ${contentType})`));
           }
         } catch (err) {
           console.error('[fmstream] JSON parse error. Raw data:', data.slice(0, 200));
@@ -109,7 +147,7 @@ async function fmstream(params = {}) {
 
   const qs = new URLSearchParams(qsParams).toString();
   const url = `https://fmstream.org/index.php?${qs}`;
-  console.info('[fmstream] Fetching URL:', url);
+  console.info('[fmstream] Fetching URL:', redactUrl(url));
 
   return fmstreamFetch(url);
 }

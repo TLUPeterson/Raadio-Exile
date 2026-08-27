@@ -1,5 +1,10 @@
 {
   "bin": "eksiilsus.js",
+  "scripts": {
+    "start": "node multiBot.js",
+    "start:single": "node eksiilsus.js",
+    "check": "node --check multiBot.js && node --check eksiilsus.js && node --check dashboard.js && node --check favorites.js && node --check history.js && node --check radio.js && node --check ui.js && node --check web/app.js"
+  },
   "pkg": {
     "scripts": [
       "node_modules/@snazzah/davey/**/*.js",
@@ -16,15 +21,14 @@
   },
   "dependencies": {
     "@discordjs/opus": "^0.9.0",
-    "@discordjs/voice": "^0.19.0",
-    "@snazzah/davey": "^0.1.7",
+    "@discordjs/voice": "^0.19.2",
+    "@snazzah/davey": "^0.1.12",
     "discord.js": "^14.24.2",
     "dotenv": "^16.0.3",
     "https": "^1.0.0",
     "node-fetch": "^2.7.0",
     "sodium-native": "^5.0.9",
     "spotify-api.js": "^9.2.5",
-    "spotify-web-api-node": "^5.0.2",
-    "youtubei.js": "^15.1.1"
+    "spotify-web-api-node": "^5.0.2"
   }
 }

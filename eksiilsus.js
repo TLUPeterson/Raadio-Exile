@@ -1,4 +1,8 @@
 // main.js
+require('dotenv').config();
+const { installLogger } = require('./logger');
+installLogger();
+
 const {
   Client, GatewayIntentBits, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ComponentType, Collection
@@ -18,6 +22,7 @@ const prism = require('prism-media');
 const radio = require('./radio');
 const youtube = require('./yt');
 const spotify = require('./spotify');
+const { addFavorite, listFavorites, removeFavorite } = require('./favorites');
 const countries = require('./data/countries');
 const { generateDependencyReport } = require('@discordjs/voice');
 const { getAvailableStyleChoices } = require('./styleAvailability');
@@ -39,7 +44,8 @@ try { require('sodium-native'); console.log("sodium-native loaded"); } catch (e)
 const {
   showMainModeMenu,
   showCountryMenu,
-  showStyleMenu
+  showStyleMenu,
+  showFavoritesMenu
 } = require('./ui');
 
 const {
@@ -47,8 +53,6 @@ const {
   pickStation,
   playRandomWorld,
 } = require('./radioDynamic');
-
-require('dotenv').config();
 
 // ----------------------------------------------------------------------
 
@@ -62,13 +66,37 @@ const client = new Client({
 });
 
 const prefix = process.env.PREFIX || '!';
-const token = process.env.TOKEN;
+const token = process.env.TOKEN || process.env.token;
+const botInstanceNumber = Number(process.env.BOT_INSTANCE_NUMBER || 1);
+const botInstanceCount = Number(process.env.BOT_INSTANCE_COUNT || 1);
+const legacyPrefixCommandsEnabled = process.env.LEGACY_PREFIX_COMMANDS !== 'false';
+const pendingPoolClaims = new Map();
 const announcementFolder = path.join(__dirname, 'audio', 'announcements');
 const announcementIntervalMs = Number(process.env.ANNOUNCEMENT_INTERVAL_MS || 3_600_000);
 const announcementExtensions = new Set(['.mp3', '.wav', '.ogg', '.m4a', '.flac']);
 const MINUTE_MS = 60_000;
 const GUILD_STATE_PRUNE_INTERVAL_MS = 10 * 60_000;
 const EMPTY_CHANNEL_DISCONNECT_MS = Number(process.env.EMPTY_CHANNEL_DISCONNECT_MS || 15 * MINUTE_MS);
+const parsedRadioResumeAttempts = Number(process.env.RADIO_RESUME_MAX_ATTEMPTS || 3);
+const parsedRadioRetryBaseMs = Number(process.env.RADIO_RESUME_RETRY_BASE_MS || 1_000);
+const parsedAnnouncementMaxDurationMs = Number(process.env.ANNOUNCEMENT_MAX_DURATION_MS || 120_000);
+const parsedRadioStablePlaybackMs = Number(process.env.RADIO_STABLE_PLAYBACK_MS || 30_000);
+const parsedRadioRetryMaxMs = Number(process.env.RADIO_RESUME_RETRY_MAX_MS || 30_000);
+const RADIO_RESUME_MAX_ATTEMPTS = Number.isFinite(parsedRadioResumeAttempts)
+  ? Math.max(1, Math.floor(parsedRadioResumeAttempts))
+  : 3;
+const RADIO_RESUME_RETRY_BASE_MS = Number.isFinite(parsedRadioRetryBaseMs)
+  ? Math.max(0, parsedRadioRetryBaseMs)
+  : 1_000;
+const ANNOUNCEMENT_MAX_DURATION_MS = Number.isFinite(parsedAnnouncementMaxDurationMs)
+  ? Math.max(10_000, parsedAnnouncementMaxDurationMs)
+  : 120_000;
+const RADIO_STABLE_PLAYBACK_MS = Number.isFinite(parsedRadioStablePlaybackMs)
+  ? Math.max(5_000, parsedRadioStablePlaybackMs)
+  : 30_000;
+const RADIO_RESUME_RETRY_MAX_MS = Number.isFinite(parsedRadioRetryMaxMs)
+  ? Math.max(RADIO_RESUME_RETRY_BASE_MS, parsedRadioRetryMaxMs)
+  : 30_000;
 
 const guildStates = new Collection();
 const radioSlashCommands = [
@@ -86,13 +114,191 @@ const radioSlashCommands = [
       {
         type: 3,
         name: 'style',
-        description: 'Stiil voi zanr',
-        required: true,
+        description: 'Stiil voi zanr, nt rock',
+        required: false,
         autocomplete: true,
+      },
+      {
+        type: 3,
+        name: 'station',
+        description: 'Jaama otsing, nt fallout voi raadio 2',
+        required: false,
       },
     ],
   },
 ];
+
+process.on('message', (message) => {
+  if (message?.type === 'pool-claim-result') {
+    const resolve = pendingPoolClaims.get(message.requestId);
+    if (!resolve) return;
+    pendingPoolClaims.delete(message.requestId);
+    resolve(message);
+    return;
+  }
+
+  if (message?.type === 'dashboard-status-request') {
+    process.send?.({
+      type: 'dashboard-status-result',
+      requestId: message.requestId,
+      instanceNumber: botInstanceNumber,
+      status: buildDashboardStatus(),
+    });
+    return;
+  }
+
+  if (message?.type === 'dashboard-command') {
+    handleDashboardCommand(message.command)
+      .then((result) => process.send?.({
+        type: 'dashboard-command-result', requestId: message.requestId, result,
+      }))
+      .catch((error) => process.send?.({
+        type: 'dashboard-command-result', requestId: message.requestId, error: error.message,
+      }));
+  }
+});
+
+function buildDashboardStatus() {
+  const guilds = client.guilds.cache.map((guild) => {
+    const state = guildStates.get(guild.id);
+    const activeChannelId = state?.connection?.joinConfig?.channelId || null;
+    const activeChannel = activeChannelId ? guild.channels.cache.get(activeChannelId) : null;
+    return {
+      id: guild.id,
+      name: guild.name,
+      voiceChannels: guild.channels.cache
+        .filter((channel) => channel.isVoiceBased?.())
+        .map((channel) => ({ id: channel.id, name: channel.name })),
+      session: state && activeChannelId ? {
+        voiceChannelId: activeChannelId,
+        voiceChannelName: activeChannel?.name || 'Unknown channel',
+        listenerCount: activeChannel?.members?.filter((member) => !member.user?.bot).size || 0,
+        station: state.lastPlayedRadioInfo ? {
+          name: state.lastPlayedRadioInfo.name,
+          url: state.lastPlayedRadioInfo.url,
+        } : null,
+        sourceType: state.currentSourceType,
+        playerStatus: state.player?.state?.status || 'idle',
+        startedAt: state.radioStartedAt || null,
+        failureCount: state.radioFailureCount || 0,
+      } : null,
+    };
+  });
+
+  return {
+    instanceNumber: botInstanceNumber,
+    online: client.isReady(),
+    bot: client.user ? { id: client.user.id, name: client.user.username, avatar: client.user.displayAvatarURL() } : null,
+    guilds,
+  };
+}
+
+async function handleDashboardCommand(command) {
+  const guild = client.guilds.cache.get(String(command.guildId));
+  if (!guild) throw new Error('Bot is not in that Discord server.');
+
+  if (command.operation === 'play') {
+    const voiceChannel = guild.channels.cache.get(String(command.voiceChannelId));
+    if (!voiceChannel?.isVoiceBased?.()) throw new Error('Voice channel was not found.');
+
+    const stationName = String(command.station?.name || '').trim().slice(0, 100);
+    const stationUrl = String(command.station?.url || '').trim();
+    const parsedUrl = new URL(stationUrl);
+    if (!stationName || !['http:', 'https:'].includes(parsedUrl.protocol)) {
+      throw new Error('Invalid station.');
+    }
+
+    const configuredTextChannel = process.env.DASHBOARD_TEXT_CHANNEL_ID
+      ? guild.channels.cache.get(process.env.DASHBOARD_TEXT_CHANNEL_ID)
+      : null;
+    const textChannel = configuredTextChannel?.send
+      ? configuredTextChannel
+      : guild.systemChannel?.send
+        ? guild.systemChannel
+        : guild.channels.cache.find((channel) => channel.isTextBased?.() && typeof channel.send === 'function');
+    if (!textChannel) throw new Error('No writable text channel is available for Now Playing messages.');
+
+    const interaction = {
+      guild,
+      guildId: guild.id,
+      channel: textChannel,
+      client,
+      user: { id: String(command.userId || 'dashboard') },
+      member: { user: { id: String(command.userId || 'dashboard') }, voice: { channel: voiceChannel } },
+      deferred: true,
+      replied: false,
+      dashboardSource: true,
+      followUp: async () => {},
+      editReply: async () => {},
+    };
+    await radio.playRadioStream(interaction, {
+      name: stationName,
+      url: stationUrl,
+      logo: command.station.logo || null,
+      color: command.station.color || null,
+    }, guildStates);
+    attachListeners(guild.id);
+    const state = guildStates.get(guild.id);
+    if (state?.connection?.joinConfig?.channelId !== voiceChannel.id) {
+      throw new Error('The bot could not start playback in that channel.');
+    }
+    return { ok: true, instanceNumber: botInstanceNumber };
+  }
+
+  if (command.operation === 'stop') {
+    const state = guildStates.get(guild.id);
+    if (!state) throw new Error('This bot has no active session in that server.');
+    await stopPlayback(guild.id, guildStates, {
+      channel: state.textChannel,
+      deferred: true,
+      replied: false,
+      isCommand: () => true,
+      editReply: async () => {},
+    });
+    return { ok: true, instanceNumber: botInstanceNumber };
+  }
+
+  throw new Error('Unknown dashboard command.');
+}
+
+function getPoolAvailability(guildId, voiceChannelId) {
+  const state = guildStates.get(guildId);
+  const activeChannelId = state?.connection?.joinConfig?.channelId;
+  const hasActiveConnection = state?.connection &&
+    state.connection.state?.status !== VoiceConnectionStatus.Destroyed;
+
+  if (hasActiveConnection && activeChannelId === voiceChannelId) return 'same';
+  if (hasActiveConnection) return 'busy';
+  return 'free';
+}
+
+function requestPoolClaim(message) {
+  if (botInstanceCount <= 1 || typeof process.send !== 'function') {
+    return Promise.resolve({ selected: legacyPrefixCommandsEnabled, noFreeBot: false });
+  }
+
+  const requestId = message.id;
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      pendingPoolClaims.delete(requestId);
+      resolve({ selected: botInstanceNumber === 1, noFreeBot: false });
+    }, 1_000);
+
+    pendingPoolClaims.set(requestId, (result) => {
+      clearTimeout(timeoutId);
+      resolve(result);
+    });
+
+    process.send({
+      type: 'pool-claim',
+      requestId,
+      instanceNumber: botInstanceNumber,
+      guildId: message.guild.id,
+      voiceChannelId: message.member?.voice?.channelId || null,
+      availability: getPoolAvailability(message.guild.id, message.member?.voice?.channelId || null),
+    });
+  });
+}
 
 function filterAutocompleteChoices(options, focusedValue, toChoice) {
   const query = String(focusedValue || '').trim().toLowerCase();
@@ -105,6 +311,59 @@ function filterAutocompleteChoices(options, focusedValue, toChoice) {
     });
 
   return choices.slice(0, 25);
+}
+
+function normalizeCountryText(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function resolveCountryCode(input) {
+  const normalizedInput = normalizeCountryText(input);
+  if (!normalizedInput) {
+    return input;
+  }
+
+  const aliases = new Map([
+    ['us', 'USA'],
+    ['usa', 'USA'],
+    ['u s a', 'USA'],
+    ['america', 'USA'],
+    ['united states', 'USA'],
+    ['united states of america', 'USA'],
+    ['uk', 'G'],
+    ['u k', 'G'],
+    ['gb', 'G'],
+    ['great britain', 'G'],
+    ['britain', 'G'],
+    ['united kingdom', 'G'],
+  ]);
+
+  if (aliases.has(normalizedInput)) {
+    return aliases.get(normalizedInput);
+  }
+
+  const upperInput = String(input || '').trim().toUpperCase();
+  const exactCode = countries.find((country) => country.code.toUpperCase() === upperInput);
+  if (exactCode) {
+    return exactCode.code;
+  }
+
+  const exactName = countries.find((country) => normalizeCountryText(country.name) === normalizedInput);
+  if (exactName) {
+    return exactName.code;
+  }
+
+  const startsWithName = countries.find((country) => normalizeCountryText(country.name).startsWith(normalizedInput));
+  if (startsWithName) {
+    return startsWithName.code;
+  }
+
+  return upperInput;
 }
 
 async function registerGuildSlashCommands(clientInstance) {
@@ -126,9 +385,22 @@ async function registerGuildSlashCommands(clientInstance) {
   }
 }
 
+async function registerGlobalSlashCommands(clientInstance) {
+  try {
+    const commands = await clientInstance.application.commands.set(radioSlashCommands);
+    const mentions = commands.map((command) => `</${command.name}:${command.id}>`);
+
+    console.log('[Slash Commands] Global commands registered:', mentions.join(' '));
+    console.log('[Slash Commands] Add these to the bot profile bio/description for clickable command links:', mentions.join(' '));
+  } catch (error) {
+    console.error('[Slash Commands] Failed to register global commands:', error);
+  }
+}
+
 client.once(Events.ClientReady, async (c) => {
-  console.log(`Logged in as ${c.user.tag}!`);
+  console.log(`[Bot ${botInstanceNumber}/${botInstanceCount}] Logged in as ${c.user.tag}!`);
   guildStates.clear();
+  await registerGlobalSlashCommands(c);
   await registerGuildSlashCommands(c);
 });
 
@@ -166,9 +438,26 @@ process.on('uncaughtException', error => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guild) return;
-  if (!message.content.startsWith(prefix)) return;
+  const directMentionPattern = new RegExp(`^<@!?${client.user.id}>\\s*`);
+  const isDirectMention = directMentionPattern.test(message.content);
+  const isPrefixCommand = message.content.startsWith(prefix);
+  if (!isDirectMention && !isPrefixCommand) return;
+  if (!isDirectMention) {
+    const claim = await requestPoolClaim(message);
+    if (!claim.selected) return;
+    if (claim.noFreeBot) {
+      await message.reply('Koik kolm raadiobotti on selles serveris juba kasutusel. Peata uks neist voi proovi hiljem.');
+      return;
+    }
+  }
 
-  const args = message.content.slice(prefix.length).trim().split(/ +/g);
+  let commandText = isDirectMention
+    ? message.content.replace(directMentionPattern, '').trim()
+    : message.content.slice(prefix.length).trim();
+  if (commandText.startsWith(prefix)) commandText = commandText.slice(prefix.length).trim();
+  if (!commandText) return;
+
+  const args = commandText.split(/ +/g);
   const command = args.shift().toLowerCase();
   const guildId = message.guild.id;
 
@@ -270,7 +559,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (focused.name === 'style') {
-      const country = interaction.options.getString('country');
+      const country = resolveCountryCode(interaction.options.getString('country'));
       if (!country) {
         await interaction.respond([]);
         return;
@@ -294,10 +583,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 
   if (interaction.isChatInputCommand() && interaction.commandName === 'radio') {
-    const country = interaction.options.getString('country', true);
-    const style = interaction.options.getString('style', true);
+    const country = resolveCountryCode(interaction.options.getString('country', true));
+    const style = interaction.options.getString('style') || '';
+    const stationSearch = interaction.options.getString('station') || '';
 
-    await showStationMenu(interaction, country, style, guildStates);
+    if (!style && !stationSearch) {
+      await interaction.reply({
+        content: 'Lisa `style` laiemaks otsinguks voi `station` konkreetse jaama leidmiseks.',
+        flags: 64,
+      });
+      return;
+    }
+
+    await showStationMenu(interaction, country, style, guildStates, { stationSearch });
     return;
   }
 
@@ -333,6 +631,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await radio.showRadioInterface(interaction.message);
         return;
       }
+
+      if (mode === 'favorites') {
+        await interaction.deferUpdate();
+        try {
+          const favorites = await listFavorites(guildId);
+          await showFavoritesMenu(interaction, favorites);
+        } catch (error) {
+          console.error(`[Favorites] Could not list favorites for guild ${guildId}:`, error);
+          await interaction.editReply({
+            content: 'Lemmikjaamade lugemine ebaõnnestus. Proovi uuesti.',
+            components: [],
+          });
+        }
+        return;
+      }
     }
 
     // --- COUNTRY SELECT ---
@@ -361,6 +674,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (customId === 'radio_favorite_pick') {
+      await interaction.deferUpdate();
+      try {
+        const favorites = await listFavorites(guildId);
+        const favorite = favorites.find((item) => item.id === interaction.values[0]);
+        if (!favorite) {
+          await interaction.followUp({
+            content: 'Seda lemmikjaama enam ei leitud. Ava lemmikute menüü uuesti.',
+            ephemeral: true,
+          });
+          return;
+        }
+
+        await radio.playRadioStream(interaction, favorite, guildStates);
+        attachListeners(guildId);
+      } catch (error) {
+        console.error(`[Favorites] Could not play favorite for guild ${guildId}:`, error);
+        await interaction.followUp({ content: 'Lemmikjaama käivitamine ebaõnnestus.', ephemeral: true });
+      }
+      return;
+    }
+
     // --- ESTONIAN STATIC MENU ---
     if (customId === 'radio_select_menu') {
       const selectedChannelKey = interaction.values[0];
@@ -369,7 +704,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         // Immediate defer to prevent timeout
         await interaction.deferUpdate();
 
-        radio.playRadioStream(interaction, selectedChannelKey, guildStates);
+        await radio.playRadioStream(interaction, selectedChannelKey, guildStates);
         attachListeners(guildId);
 
         // PERSISTENCE: keeping the menu active, so user can pick another one.
@@ -418,13 +753,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    if (id === 'radio_favorite_add' || id === 'radio_favorite_remove') {
+      await interaction.deferReply({ flags: 64 });
+      const state = guildStates.get(guildId);
+      const station = state?.lastPlayedRadioInfo;
+      if (!station?.url) {
+        await interaction.editReply('Selle jaama info pole enam saadaval. Käivita jaam uuesti.');
+        return;
+      }
+
+      try {
+        if (id === 'radio_favorite_add') {
+          const result = await addFavorite(guildId, station, interaction.user.id);
+          await interaction.editReply(result.added
+            ? `Lisasin **${result.favorite.name}** serveri lemmikutesse (${result.count}/25).`
+            : `**${result.favorite.name}** on juba serveri lemmikutes.`);
+        } else {
+          const result = await removeFavorite(guildId, station.url);
+          await interaction.editReply(result.removed
+            ? `Eemaldasin **${result.favorite.name}** serveri lemmikutest.`
+            : 'See jaam ei olnud serveri lemmikutes.');
+        }
+      } catch (error) {
+        console.error(`[Favorites] Update failed for guild ${guildId}:`, error);
+        await interaction.editReply(`Lemmikute muutmine ebaõnnestus: ${error.message}`);
+      }
+      return;
+    }
+
     if (id === 'radio_random') {
       const radioKeys = Object.keys(radio.radioChannels).filter(k => k !== 'stop');
 
       if (radioKeys.length > 0) {
         const key = radioKeys[Math.floor(Math.random() * radioKeys.length)];
         await interaction.deferUpdate();
-        radio.playRadioStream(interaction, key, guildStates);
+        await radio.playRadioStream(interaction, key, guildStates);
         attachListeners(guildId);
 
         // PERSISTENCE: Keep menu active
@@ -571,6 +934,110 @@ function clearAnnouncementScheduler(state) {
   }
 }
 
+function clearAnnouncementWatchdog(state) {
+  if (state?.announcementWatchdogId) {
+    clearTimeout(state.announcementWatchdogId);
+    state.announcementWatchdogId = null;
+  }
+}
+
+function clearRadioRecovery(state) {
+  if (state?.radioRecoveryTimer) {
+    clearTimeout(state.radioRecoveryTimer);
+    state.radioRecoveryTimer = null;
+  }
+}
+
+async function resumeRadioWithRetry(guildId, states, reason) {
+  const state = states.get(guildId);
+  if (!state) return false;
+
+  if (state.radioResumePromise) {
+    return state.radioResumePromise;
+  }
+
+  const expectedPlaybackGeneration = state.radioPlaybackGeneration || 0;
+  const resumePromise = (async () => {
+    const currentState = states.get(guildId);
+    if (!currentState ||
+        !currentState.connection ||
+        currentState.connection.state.status === VoiceConnectionStatus.Destroyed) {
+      return false;
+    }
+
+    if (currentState.radioPlaybackGeneration !== expectedPlaybackGeneration) {
+      return currentState.currentSourceType === 'radio' &&
+        currentState.player?.state?.status !== AudioPlayerStatus.Idle;
+    }
+
+    console.log(`[Radio Recovery] Guild ${guildId}: ${reason}`);
+    return radio.resumeRadioStream(guildId, states, { expectedPlaybackGeneration });
+  })();
+
+  state.radioResumePromise = resumePromise;
+
+  try {
+    return await resumePromise;
+  } finally {
+    const currentState = states.get(guildId);
+    if (currentState?.radioResumePromise === resumePromise) {
+      currentState.radioResumePromise = null;
+    }
+  }
+}
+
+function recoverRadioOrStartInactivityTimer(guildId, states, reason, options = {}) {
+  const state = states.get(guildId);
+  if (!state || state.radioRecoveryTimer || state.radioResumePromise) return;
+
+  const countFailure = options.countFailure !== false;
+  if (countFailure) {
+    const playbackDuration = state.radioStartedAt ? Date.now() - state.radioStartedAt : 0;
+    if (playbackDuration >= RADIO_STABLE_PLAYBACK_MS) state.radioFailureCount = 0;
+    state.radioFailureCount = (state.radioFailureCount || 0) + 1;
+    state.radioStartedAt = null;
+  }
+
+  const failureCount = state.radioFailureCount || 0;
+  if (countFailure && failureCount > RADIO_RESUME_MAX_ATTEMPTS) {
+    console.error(
+      `[Radio Recovery] Guild ${guildId}: circuit breaker opened after ${RADIO_RESUME_MAX_ATTEMPTS} retries`
+    );
+    state.currentSourceType = null;
+    if (state.radioFailureNoticeGeneration !== state.radioPlaybackGeneration) {
+      state.radioFailureNoticeGeneration = state.radioPlaybackGeneration;
+      state.textChannel?.send(
+        `Raadiostriim katkes korduvalt. Lopetasin parast ${RADIO_RESUME_MAX_ATTEMPTS} katset, et valtimata liigseid paringuid.`
+      ).catch(() => {});
+    }
+    setInactivityTimeout(guildId, states);
+    return;
+  }
+
+  const delayMs = countFailure
+    ? Math.min(RADIO_RESUME_RETRY_MAX_MS, RADIO_RESUME_RETRY_BASE_MS * (2 ** Math.max(0, failureCount - 1)))
+    : 0;
+
+  console.log(
+    `[Radio Recovery] Guild ${guildId}: scheduling ${countFailure ? `retry ${failureCount}/${RADIO_RESUME_MAX_ATTEMPTS}` : 'resume'} in ${delayMs}ms`
+  );
+
+  state.radioRecoveryTimer = setTimeout(() => {
+    const currentState = states.get(guildId);
+    if (!currentState) return;
+    currentState.radioRecoveryTimer = null;
+
+    resumeRadioWithRetry(guildId, states, reason)
+      .then((resumed) => {
+        if (!resumed) recoverRadioOrStartInactivityTimer(guildId, states, 'resume failed');
+      })
+      .catch((error) => {
+        console.error(`[Radio Recovery] Unexpected failure for guild ${guildId}:`, error);
+        recoverRadioOrStartInactivityTimer(guildId, states, 'resume failed');
+      });
+  }, delayMs);
+}
+
 function getAlignedAnnouncementDelayMs(intervalMs, now = new Date()) {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
     return null;
@@ -634,6 +1101,7 @@ async function playAnnouncementClip(guildId, states, options = {}) {
   if (files.length === 0) return false;
 
   const filePath = files[Math.floor(Math.random() * files.length)];
+  const fileName = path.basename(filePath);
   const ffmpegStream = new prism.FFmpeg({
     args: [
       '-analyzeduration', '0',
@@ -653,8 +1121,24 @@ async function playAnnouncementClip(guildId, states, options = {}) {
     Boolean(state.lastPlayedRadioInfo || state.lastPlayedRadioKey);
   state.currentSourceType = 'announcement';
   clearTimeout(state.timeoutId);
+  clearAnnouncementWatchdog(state);
 
+  console.log(`[Announcements] Starting ${fileName} for guild ${guildId}`);
   state.player.play(resource);
+  state.announcementWatchdogId = setTimeout(() => {
+    const currentState = states.get(guildId);
+    if (!currentState ||
+        currentState.currentSourceType !== 'announcement' ||
+        !currentState.isAnnouncementPlaying) {
+      return;
+    }
+
+    console.error(
+      `[Announcements] Watchdog stopped ${fileName} after ${ANNOUNCEMENT_MAX_DURATION_MS}ms ` +
+      `(guild ${guildId})`
+    );
+    currentState.player?.stop(true);
+  }, ANNOUNCEMENT_MAX_DURATION_MS);
   return true;
 }
 
@@ -697,6 +1181,8 @@ async function stopPlayback(guildId, states, context) {
 
   if (state) {
     clearAnnouncementScheduler(state);
+    clearAnnouncementWatchdog(state);
+    clearRadioRecovery(state);
     clearTimeout(state.timeoutId);
     clearEmptyChannelTimeout(state);
     state.isAnnouncementPlaying = false;
@@ -773,45 +1259,48 @@ function setupGuildPlayerListeners(guildId, states) {
   state.player.removeAllListeners(AudioPlayerStatus.Idle);
   state.player.removeAllListeners('error');
   state.player.removeAllListeners(AudioPlayerStatus.Playing);
+  state.player.removeAllListeners('stateChange');
 
   state.player.on(AudioPlayerStatus.Idle, (oldState) => {
     const currentState = states.get(guildId);
     if (!currentState) return;
 
-    if (oldState.status === AudioPlayerStatus.Playing) {
-      if (currentState.currentSourceType === 'announcement') {
-        currentState.isAnnouncementPlaying = false;
+    const endedSourceType = currentState.currentSourceType;
+    console.log(
+      `[Player] Guild ${guildId}: ${endedSourceType || 'unknown'} entered Idle from ${oldState.status}`
+    );
 
-        if (currentState.resumeRadioAfterAnnouncement) {
-          radio.resumeRadioStream(guildId, states)
-            .then((resumed) => {
-              if (!resumed) {
-                setInactivityTimeout(guildId, states);
-              }
-            })
-            .catch((error) => {
-              console.error(`[Announcements] Could not resume radio for guild ${guildId}:`, error);
-              setInactivityTimeout(guildId, states);
-            });
-          return;
-        }
+    if (endedSourceType === 'announcement') {
+      clearAnnouncementWatchdog(currentState);
+      currentState.isAnnouncementPlaying = false;
+      const shouldResumeRadio = currentState.resumeRadioAfterAnnouncement;
+      currentState.resumeRadioAfterAnnouncement = false;
+
+      if (shouldResumeRadio) {
+        recoverRadioOrStartInactivityTimer(guildId, states, 'announcement ended', { countFailure: false });
+        return;
+      }
+    }
+
+    if (endedSourceType === 'radio') {
+      recoverRadioOrStartInactivityTimer(guildId, states, 'radio stream ended');
+      return;
+    }
+
+    if (endedSourceType === 'youtube') {
+      if (currentState.queue?.length > 0) {
+        currentState.queue.shift();
       }
 
-      if (currentState.currentSourceType === 'youtube') {
-        if (currentState.queue?.length > 0) {
-          currentState.queue.shift();
-        }
-
-        if (currentState.queue?.length > 0) {
-          youtube.playFromQueue(guildId, states);
-        } else {
-          currentState.currentSourceType = null;
-          setInactivityTimeout(guildId, states);
-        }
+      if (currentState.queue?.length > 0) {
+        youtube.playFromQueue(guildId, states);
       } else {
         currentState.currentSourceType = null;
         setInactivityTimeout(guildId, states);
       }
+    } else {
+      currentState.currentSourceType = null;
+      setInactivityTimeout(guildId, states);
     }
   });
 
@@ -819,17 +1308,21 @@ function setupGuildPlayerListeners(guildId, states) {
     const currentState = states.get(guildId);
     if (!currentState) return;
 
-    console.error(`[Player Error] Guild ${guildId}:`, err.message);
+    const failedSourceType = currentState.currentSourceType;
+    console.error(`[Player Error] Guild ${guildId} (${failedSourceType || 'unknown'}):`, err);
 
-     if (currentState.currentSourceType === 'announcement') {
+    if (failedSourceType === 'announcement') {
+      clearAnnouncementWatchdog(currentState);
       currentState.isAnnouncementPlaying = false;
       if (currentState.resumeRadioAfterAnnouncement) {
-        radio.resumeRadioStream(guildId, states).catch((resumeError) => {
-          console.error(`[Announcements] Resume failed after player error for guild ${guildId}:`, resumeError);
-          setInactivityTimeout(guildId, states);
-        });
+        recoverRadioOrStartInactivityTimer(guildId, states, 'announcement player error', { countFailure: false });
         return;
       }
+    }
+
+    if (failedSourceType === 'radio') {
+      recoverRadioOrStartInactivityTimer(guildId, states, 'radio player error');
+      return;
     }
 
     if (currentState.connection && currentState.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -840,7 +1333,19 @@ function setupGuildPlayerListeners(guildId, states) {
 
   state.player.on(AudioPlayerStatus.Playing, () => {
     const currentState = states.get(guildId);
-    if (currentState) clearTimeout(currentState.timeoutId);
+    if (currentState) {
+      clearTimeout(currentState.timeoutId);
+      if (currentState.currentSourceType === 'radio') currentState.radioStartedAt = Date.now();
+      console.log(`[Player] Guild ${guildId}: playing ${currentState.currentSourceType || 'unknown'} source`);
+    }
+  });
+
+  state.player.on('stateChange', (oldState, newState) => {
+    if (oldState.status !== newState.status) {
+      console.log(
+        `[Player State] Guild ${guildId}: ${oldState.status} -> ${newState.status}`
+      );
+    }
   });
 }
 
@@ -871,6 +1376,8 @@ function setupGuildConnectionListeners(guildId, states) {
 
     if (current.player) current.player.stop(true);
     clearAnnouncementScheduler(current);
+    clearAnnouncementWatchdog(current);
+    clearRadioRecovery(current);
     clearTimeout(current.timeoutId);
     clearEmptyChannelTimeout(current);
 
@@ -897,10 +1404,15 @@ function setInactivityTimeout(guildId, states) {
   }, 300_000); // 5 min
 }
 
-process.on('SIGINT', () => {
-  console.log("Shutting down: Cleaning up connections...");
+let isShuttingDown = false;
+function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  console.log(`${signal}: Cleaning up connections...`);
   guildStates.forEach((state, guildId) => {
     clearAnnouncementScheduler(state);
+    clearAnnouncementWatchdog(state);
+    clearRadioRecovery(state);
     clearEmptyChannelTimeout(state);
     if (state.connection && state.connection.state.status !== 'destroyed') {
       state.connection.destroy();
@@ -909,7 +1421,10 @@ process.on('SIGINT', () => {
   client.destroy();
   console.log("Client destroyed. Exiting.");
   process.exit(0);
-});
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 setInterval(() => {
   pruneGuildStates(guildStates);
@@ -919,4 +1434,9 @@ process.on('exit', (code) => {
   console.log(`Process exited with code: ${code}`);
 });
 
-client.login(token);
+if (!token) {
+  console.error('Discord bot token is missing. Set TOKEN in the environment.');
+  process.exitCode = 1;
+} else {
+  client.login(token);
+}

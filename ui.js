@@ -68,6 +68,7 @@ async function showMainModeMenu(channel, interaction = null) {
       { label: 'Juhuslik jaam (maailmast)', value: 'random_world' },
       { label: 'Riik + stiil', value: 'country_style' },
       { label: 'Eesti eelseatud jaamad', value: 'estonian' },
+      { label: 'Lemmikud', value: 'favorites' },
     ]);
 
   const modeRow = new ActionRowBuilder().addComponents(modeMenu);
@@ -123,6 +124,36 @@ async function showCountryMenu(interaction) {
     content: 'Vali riik:',
     components: [menuRow, btnRow],
   });
+}
+
+async function showFavoritesMenu(interaction, favorites) {
+  const backBtn = new ButtonBuilder()
+    .setCustomId('radio_back_main')
+    .setLabel('Tagasi')
+    .setStyle(ButtonStyle.Secondary);
+  const rows = [];
+
+  if (favorites.length > 0) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('radio_favorite_pick')
+      .setPlaceholder('Vali lemmikjaam')
+      .addOptions(favorites.slice(0, 25).map((favorite) => ({
+        label: String(favorite.name || 'Nimetu jaam').slice(0, 100),
+        value: String(favorite.id),
+      })));
+    rows.push(new ActionRowBuilder().addComponents(menu));
+  }
+
+  rows.push(new ActionRowBuilder().addComponents(backBtn));
+  const payload = {
+    content: favorites.length > 0
+      ? `Vali serveri lemmikjaam (${favorites.length}/25):`
+      : 'Sellel serveril pole veel lemmikjaamu. Lisa jaam nupuga "Lisa lemmikuks".',
+    components: rows,
+  };
+
+  if (interaction.deferred || interaction.replied) return interaction.editReply(payload);
+  return interaction.update(payload);
 }
 
 async function showStyleMenu(interaction, countryCode) {
@@ -211,4 +242,5 @@ module.exports = {
   showCountryMenu,
   showStyleMenu,
   showStationMenu,
+  showFavoritesMenu,
 };

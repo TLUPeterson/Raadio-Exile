@@ -11,6 +11,16 @@ const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
+const RADIO_CONNECT_TIMEOUT_MS = Number(process.env.RADIO_CONNECT_TIMEOUT_MS || 15_000);
+const HLS_CONTENT_TYPE_PATTERN = /(?:application|audio)\/(?:vnd\.apple\.mpegurl|x-mpegurl)/i;
+
+function isHlsStream(url, contentType = '') {
+  try {
+    if (new URL(url).pathname.toLowerCase().endsWith('.m3u8')) return true;
+  } catch (_) {}
+  return HLS_CONTENT_TYPE_PATTERN.test(String(contentType));
+}
+
 // Static Estonian stations
 const radioChannels = {
   'raadio2': {
@@ -79,6 +89,7 @@ function getFinalStream(url, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const client = u.protocol === "https:" ? https : http;
+    let responseTimeoutId = null;
 
     const req = client.request(
       u,
@@ -92,6 +103,11 @@ function getFinalStream(url, maxRedirects = 5) {
         },
       },
       (res) => {
+        if (responseTimeoutId) {
+          clearTimeout(responseTimeoutId);
+          responseTimeoutId = null;
+        }
+
         // Follow redirects
         if (
           res.statusCode >= 300 &&
@@ -100,10 +116,14 @@ function getFinalStream(url, maxRedirects = 5) {
           maxRedirects > 0
         ) {
           res.destroy();
-          return resolve(getFinalStream(res.headers.location, maxRedirects - 1));
+          const redirectUrl = new URL(res.headers.location, u).toString();
+          return resolve(getFinalStream(redirectUrl, maxRedirects - 1));
         }
 
-        if (res.statusCode === 200) return resolve(res);
+        if (res.statusCode === 200) {
+          res.finalUrl = u.toString();
+          return resolve(res);
+        }
 
         // Bubble up exact status for your error message
         res.resume(); // drain
@@ -111,12 +131,46 @@ function getFinalStream(url, maxRedirects = 5) {
       }
     );
 
-    req.on("error", reject);
+    if (Number.isFinite(RADIO_CONNECT_TIMEOUT_MS) && RADIO_CONNECT_TIMEOUT_MS > 0) {
+      responseTimeoutId = setTimeout(() => {
+        req.destroy(new Error(`Radio stream response timed out after ${RADIO_CONNECT_TIMEOUT_MS}ms`));
+      }, RADIO_CONNECT_TIMEOUT_MS);
+    }
+
+    req.on("error", (error) => {
+      if (responseTimeoutId) {
+        clearTimeout(responseTimeoutId);
+        responseTimeoutId = null;
+      }
+      reject(error);
+    });
     req.end();
   });
 }
 
-async function resumeRadioStream(guildId, guildStates) {
+async function createRadioResource(streamUrl) {
+  // Passing a URL to createAudioResource makes @discordjs/voice use FFmpeg.
+  // HLS playlists must be opened this way so FFmpeg follows their media segments.
+  if (isHlsStream(streamUrl)) {
+    console.log(`[Radio] Opening HLS stream through FFmpeg: ${streamUrl}`);
+    return createAudioResource(streamUrl);
+  }
+
+  const response = await getFinalStream(streamUrl);
+  const finalUrl = response.finalUrl || streamUrl;
+  const contentType = response.headers['content-type'] || '';
+
+  if (isHlsStream(finalUrl, contentType)) {
+    response.destroy();
+    console.log(`[Radio] Detected HLS content; reopening through FFmpeg: ${finalUrl}`);
+    return createAudioResource(finalUrl);
+  }
+
+  return createAudioResource(response);
+}
+
+async function resumeRadioStream(guildId, guildStates, options = {}) {
+  const { expectedPlaybackGeneration = null } = options;
   const state = guildStates.get(guildId);
   if (!state) return false;
   if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
@@ -137,18 +191,27 @@ async function resumeRadioStream(guildId, guildStates) {
     state.playerListenersAttached = false;
   }
 
-  if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
+  if (!state.connection.state.subscription || state.connection.state.subscription.player !== state.player) {
     state.connection.subscribe(state.player);
   }
 
   try {
-    const res = await getFinalStream(channelInfo.url);
-    const resource = createAudioResource(res);
+    console.log(`[Radio] Reopening ${channelInfo.name} for guild ${guildId}`);
+    const resource = await createRadioResource(channelInfo.url);
+
+    if (guildStates.get(guildId) !== state ||
+        (expectedPlaybackGeneration !== null &&
+          state.radioPlaybackGeneration !== expectedPlaybackGeneration)) {
+      resource.playStream?.destroy();
+      console.log(`[Radio] Discarded stale resume for guild ${guildId}`);
+      return false;
+    }
 
     state.currentSourceType = 'radio';
     state.isAnnouncementPlaying = false;
     state.resumeRadioAfterAnnouncement = false;
     state.player.play(resource);
+    console.log(`[Radio] Resumed ${channelInfo.name} for guild ${guildId}`);
     return true;
   } catch (err) {
     console.error(`[Radio] Failed to resume stream for guild ${guildId}:`, err.message);
@@ -230,6 +293,15 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
   state.textChannel = interaction.channel;
   state.lastPlayedRadioKey = channelKey || null;
   state.lastPlayedRadioInfo = { ...channelInfo };
+  state.radioPlaybackGeneration = (state.radioPlaybackGeneration || 0) + 1;
+  state.radioResumePromise = null;
+  state.radioFailureCount = 0;
+  state.radioStartedAt = null;
+  state.radioFailureNoticeGeneration = null;
+  if (state.radioRecoveryTimer) {
+    clearTimeout(state.radioRecoveryTimer);
+    state.radioRecoveryTimer = null;
+  }
   clearTimeout(state.timeoutId);
 
   // Delete previous now-playing message
@@ -298,7 +370,7 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
     state.playerListenersAttached = false;
   }
 
-  if (!state.connection.subscription || state.connection.subscription.player !== state.player) {
+  if (!state.connection.state.subscription || state.connection.state.subscription.player !== state.player) {
     state.connection.subscribe(state.player);
   }
 
@@ -307,6 +379,16 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
 
   let sentMessage;
   try {
+    const favoriteRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('radio_favorite_add')
+        .setLabel('Lisa lemmikuks')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('radio_favorite_remove')
+        .setLabel('Eemalda lemmikutest')
+        .setStyle(ButtonStyle.Secondary)
+    );
     const playEmbed = new EmbedBuilder()
       .setColor(channelInfo.color || Math.floor(Math.random() * 0xFFFFFF))
       .setTitle('Häälestun Raadiole...')
@@ -314,7 +396,7 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
       .setThumbnail(channelInfo.logo || null)
       .setFooter({ text: `Häälekanal: ${voiceChannel.name}` });
 
-    sentMessage = await state.textChannel.send({ embeds: [playEmbed] });
+    sentMessage = await state.textChannel.send({ embeds: [playEmbed], components: [favoriteRow] });
     state.nowPlayingRadioMsgId = sentMessage.id;
 
     interaction.followUp?.({
@@ -323,11 +405,24 @@ async function playRadioStream(interaction, channelOrKey, guildStates) {
     }).catch(() => { });
 
     try {
-      const res = await getFinalStream(streamUrl);
-
-      const resource = createAudioResource(res);
+      const resource = await createRadioResource(streamUrl);
 
       state.player.play(resource);
+
+      if (typeof process.send === 'function') {
+        process.send({
+          type: 'playback-started',
+          entry: {
+            guildId,
+            station: state.lastPlayedRadioInfo,
+            botInstance: Number(process.env.BOT_INSTANCE_NUMBER || 1),
+            voiceChannelId: voiceChannel.id,
+            voiceChannelName: voiceChannel.name,
+            requestedBy: interaction.user?.id || interaction.member?.user?.id || null,
+            source: interaction.dashboardSource === true ? 'web' : 'discord',
+          },
+        });
+      }
 
       playEmbed
         .setTitle('Mängib Nüüd (Raadio)')
@@ -425,6 +520,7 @@ function disableComponents(components) {
 
 module.exports = {
   radioChannels,
+  isHlsStream,
   playRadioStream,
   resumeRadioStream,
   showRadioInterface,
